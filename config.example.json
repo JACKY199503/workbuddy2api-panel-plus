@@ -67,5 +67,43 @@
     "enabled": true,
     "ttl": "30m",
     "gc_interval": "5m"
+  },
+  "trust_proxy": false,
+  "auto_model": {
+    "enabled": true,
+    "day_primary": "cn:hy3",
+    "night_primary": "cn:hy4-preview",
+    "day_start": 8,
+    "day_end": 23,
+    "fallback": [
+      "cn:hy3",
+      "cn:deepseek-v4.1-flash",
+      "cn:glm-5.3-flash",
+      "cn:hy3-x"
+    ],
+    "virtual_id": "auto",
+    "override": true,
+    "on_empty": true,
+    "fallback_on": null
+  },
+  "model_fallback": {
+    "cn:hy3": [
+      "cn:deepseek-v4.1-flash",
+      "cn:glm-5.3-flash",
+      "cn:hy3-x"
+    ],
+    "cn:hy4-preview": [
+      "cn:hy3",
+      "cn:deepseek-v4.1-flash",
+      "cn:glm-5.3-flash",
+      "cn:hy3-x"
+    ],
+    "cn:deepseek-v4.1-flash": [
+      "cn:glm-5.3-flash",
+      "cn:hy3-x"
+    ],
+    "cn:glm-5.3-flash": [
+      "cn:hy3-x"
+    ]
   }
 }

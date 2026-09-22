@@ -52,7 +52,8 @@ python t_edge.py
 2. 用它调被禁模型 → 期望 **400**
 3. 换允许的模型 → 期望 **200**，响应头带 `X-WB2A-Routed-Model`
 4. 把它停用 → 期望 **403**
-5. `curl $WB2A_BASE/v1/chat/completions -d '{"model":"auto",...}'` → 期望 200，routed 头是当时段的主模型
+5. `curl $WB2A_BASE/v1/chat/completions -d '{"model":"auto",...}'` → 期望 200，routed 头是当时段的主模型（白天 08:00–23:00 为 `cn:hy3`，夜间为 `cn:hy4-preview`）
+6. 面板「配置」页核对 `auto_model`：`day_primary=cn:hy3` / `night_primary=cn:hy4-preview` / `fallback=[cn:hy3, cn:deepseek-v4.1-flash, cn:glm-5.3-flash, cn:hy3-x]`
 
 ## 四、回归时的几条硬约束
 

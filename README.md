@@ -32,7 +32,7 @@
 >
 > 新增的两项功能（本文有专章说明）：
 > 1. **API 密钥分发** —— 把一把管理员 `api_key` 拆成 N 把带额度 / 白名单 / 有效期的子钥匙（`wbk_` 前缀）
-> 2. **模型编排** —— `auto` 虚拟模型按昼夜时段自动挑主模型，失败沿降级链逐级换模型 / 换号
+> 2. **模型编排** —— 客户端只写 `auto`，网关按昼夜时段自动挑主模型（白天 `cn:hy3` / 夜间 `cn:hy4-preview`），**把每天的免费额度薅满**；限流、额度耗尽、优惠到期或返回空回复时自动沿降级链换模型，配置一行不用改
 >
 > 其余全部能力（账号池调度、冷却熔断、签到任务、Web 面板等）均来自上游，未做删改，上游 README 的用法同样适用。
 
@@ -135,11 +135,30 @@ curl http://HOST:7863/v1/chat/completions \
 
 ---
 
-## 🆕 新增二：模型编排（auto 虚拟模型 + 降级链）
+<a id="model-orchestration"></a>
 
-**解决什么问题**：上游模型会限流、会额度耗尽、会返回空正文，客户端写死一个模型名就只能跟着挂。现在客户端写 `model=auto`，网关按时间挑主模型，出问题自动沿链换模型 / 换号，对客户端完全透明。
+## 🆕 新增二：模型编排（auto · 免费额度薅满 · 昼夜自动切换）
 
-**配置**（`config.json` 的 `auto_model` 段，面板「配置」页可直接改，保存即热生效）
+**一句话目的**：把每天能白嫖的额度尽量用满；免费窗口过期、额度波动、被限流时**自动**换模型，全程不用手动改配置。
+
+做法只有一个：客户端写 `model=auto`，剩下的全交给网关。具名模型（`cn:hy3` 之类）不受任何影响，照旧原样透传。
+
+- **按钟点自动换主模型**：白天吃白天的免费额度，夜里吃夜里的免费窗口，到点自动切回。
+- **出问题自动沿链降级**：主模型被限流 / 积分耗尽 / 上游报错 / 返回空正文，就沿降级链往下挑下一个能用的。
+- **优惠到期不用管**：链是按「免费 → 低倍率 → 兜底」排的，免费额度没了自然落到下一个，配置一行不用动。
+
+### 自动切换逻辑
+
+| 时段（Asia/Shanghai） | 主模型 | 完整候选链（链首首选，失败才往下走） |
+|---|---|---|
+| **白天 08:00–23:00** | `cn:hy3`（免费） | `cn:hy3` → `cn:deepseek-v4.1-flash`（0.03x）→ `cn:glm-5.3-flash`（0.06x，1M 上下文、能看图）→ `cn:hy3-x`（0.05x，兜底） |
+| **夜间 23:00–08:00** | `cn:hy4-preview`（夜间老用户免费窗口） | `cn:hy4-preview` → `cn:hy3` → `cn:deepseek-v4.1-flash` → `cn:glm-5.3-flash` → `cn:hy3-x` |
+
+- 切换**不是定时任务**：每次请求进来按当前小时判定，08:00 一到请求自然回到 `cn:hy3`，无需重启、无需改配置。
+- 白天主模型 `cn:hy3` 本身也在降级链里 —— 夜里 `cn:hy4-preview` 挂掉时接上的就是它；白天它已是链首，链里重复出现的那一项会被**自动去重跳过**。所以一条 `fallback` 同时服务昼夜两个时段。
+- 链尾 `cn:hy3-x` 是兜底位：只要账号还有额度就一定有响应，不会把请求打空。
+
+### 配置（`config.json` 的 `auto_model` 段；面板「配置」页可直接改，保存热生效）
 
 ```json
 "auto_model": {
@@ -147,41 +166,55 @@ curl http://HOST:7863/v1/chat/completions \
   "day_primary":   "cn:hy3",
   "night_primary": "cn:hy4-preview",
   "day_start": 8,
-  "day_end":   23,
-  "fallback": ["cn:hy4-preview", "cn:glm-5.3"],
+  "day_end": 23,
+  "fallback": ["cn:hy3", "cn:deepseek-v4.1-flash", "cn:glm-5.3-flash", "cn:hy3-x"],
   "on_empty": true,
   "virtual_id": "auto",
-  "override": false
+  "override": true
 }
 ```
 
 | 字段 | 含义 |
 |---|---|
-| `enabled` | 编排开关，false（默认）= `auto` 当普通模型名直出，零回归 |
+| `enabled` | 编排开关。**代码缺省 false**（不写这段 = `auto` 当普通模型名直出，零回归）；本仓库 `config.example.json` 给的是 `true`（开箱即薅额度） |
 | `day_primary` / `night_primary` | 白天 / 夜间主模型（带 realm 前缀） |
-| `day_start` / `day_end` | 白天窗口 `[start, end)`，**按 Asia/Shanghai 小时**判定，默认 8 / 23 |
-| `fallback` | 有序降级链（带 realm 前缀） |
-| `virtual_id` / `override` | 虚拟模型名（默认 `auto`）；与上游真实模型同名时是否强行接管 |
+| `day_start` / `day_end` | 白天窗口 `[start, end)`，按 **Asia/Shanghai 小时**判定，默认 8 / 23（08:00–23:00 白天，其余为夜间） |
+| `fallback` | 有序降级链（带 realm 前缀），昼夜共用；与主模型重复项自动跳过 |
+| `virtual_id` / `override` | 虚拟模型名（默认 `auto`）；与上游真实模型同名时是否强行接管（上游 cn 侧下发过同名 `auto`，想接管就开 true 或改名） |
 | `on_empty` | 上游 200 但正文为空也算失败并降级（部分模型 `reasoning_effort=max` 吃满预算会返回空），默认 true |
 | `fallback_on` | 可触发降级的错误类别，空 = 内置默认集合 |
 
-**具名模型也能挂链**（`model_fallback`，键是客户端写的模型名，逐字匹配）：
+### 什么情况会降级
+
+429 软限流 · 402 额度耗尽 · 上游 `11102` · 5xx · 无健康账号 · 上游 200 空正文（`on_empty`）。
+
+反例（**不降级**）：内容拦截、参数错误、上下文超长、请求体解析失败 —— 这些是请求本身的问题，换任何模型都一样撞墙，直接 fail-fast。
+
+### 具名模型也能挂同一条链
+
+`model_fallback` 的键是客户端写的模型名（逐字匹配），这样即使客户端写死 `cn:hy3`，也能享受和 `auto` 一样的降级：
 
 ```json
-"model_fallback": { "cn:glm-5.3": ["cn:hy4-preview", "cn:hy3"] }
+"model_fallback": {
+  "cn:hy3":               ["cn:deepseek-v4.1-flash", "cn:glm-5.3-flash", "cn:hy3-x"],
+  "cn:hy4-preview":       ["cn:hy3", "cn:deepseek-v4.1-flash", "cn:glm-5.3-flash", "cn:hy3-x"],
+  "cn:deepseek-v4.1-flash": ["cn:glm-5.3-flash", "cn:hy3-x"],
+  "cn:glm-5.3-flash":     ["cn:hy3-x"]
+}
 ```
 
-两条链可叠加：链上每一项再按本表递归展开（限深 3、去重）。
+两条链可叠加：链上每一项再按本表递归展开（限深 3、链长 ≤ 8、去重）。
 
-**什么情况会降级**：429 软限流 · 402 额度耗尽 · 上游 `11102` · 5xx · 无健康账号 · 上游 200 空正文（`on_empty`）。
+### 怎么知道实际用了哪个模型
 
-**怎么知道实际用了哪个模型**：响应头 `X-WB2A-Routed-Model`。
+响应头 `X-WB2A-Routed-Model`：
 
 ```bash
 curl -i http://HOST:7863/v1/chat/completions \
   -H "Authorization: Bearer <你的key>" -H "Content-Type: application/json" \
   -d '{"model":"auto","messages":[{"role":"user","content":"hi"}],"stream":false}'
-# 响应头里：X-WB2A-Routed-Model: cn:hy4-preview
+# 白天：X-WB2A-Routed-Model: cn:hy3
+# 夜里：X-WB2A-Routed-Model: cn:hy4-preview
 ```
 
 **一处语义修正**：上游业务码 `14018`（`Credits exhausted`，账号积分耗尽）原本被归进 `rate_limit_exceeded` 当限流处理 —— 重试不可能成功。现已单列为 `402 upstream_credits_exhausted`，提示直接写明「需充值 / 等额度重置」。
@@ -282,7 +315,7 @@ curl -i http://HOST:7863/v1/chat/completions \
 | **安全加固** | 常量时间密钥比较（`internal/httpauth`）、CSP 与安全响应头、UID 白名单防路径穿越、前端属性转义修复 |
 | **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；本分支修正后实测 +300 到账（3/3 账号） |
 | 🆕 **API 密钥分发**（**本仓库二改**） | `internal/apikeys` + `/panel/api/keys`：管理员 key 拆成 N 把 `wbk_` 子钥匙，各自带额度 / IP 白名单 / 模型白名单 / realm / 有效期，见 [专章](#-新增一api-密钥分发wbk_-子钥匙) |
-| 🆕 **模型编排**（**本仓库二改**） | `internal/autoroute`：`auto` 虚拟模型按时段挑主模型，失败沿降级链换模型 / 换号，见 [专章](#-新增二模型编排auto-虚拟模型--降级链) |
+| 🆕 **模型编排**（**本仓库二改**） | `internal/autoroute`：`auto` 虚拟模型按时段挑主模型（昼夜各一个免费模型），失败沿降级链换模型 / 换号，见 [专章](#model-orchestration) |
 
 ### 同步上游
 
@@ -338,26 +371,28 @@ flowchart LR
 
 ### 环境要求
 
-- **Docker + Docker Compose**（服务端部署方式，镜像内已含低权限用户与全部工具脚本）——或
-- **Windows / macOS / Linux 直接跑单文件二进制**（无需 Docker，见下方「Windows 单文件运行」）
+- **Docker + Docker Compose**（镜像内已含全部二进制与工具脚本，宿主机无需装 Go）
 - 一个或多个已注册的 CodeBuddy 账号，用于 OAuth 登录
-- 宿主机 Go ≥ 1.22（仅从源码构建时需要）
 
-### 方式一：Docker Compose（推荐服务器部署）
+### Docker Compose 部署（唯一方式）
 
 ```bash
 # 1. 克隆
-git clone https://github.com/linguo2625469/workbuddy2api-panel.git
-cd workbuddy2api-panel
+git clone https://github.com/JACKY199503/workbuddy2api-panel-plus.git
+cd workbuddy2api-panel-plus
 
-# 2. 准备配置（compose 挂载此文件，缺失会导致容器启动失败）
-cp config.example.json config.json
-#    建议编辑 config.json 设置 api_key（或留空由程序自动生成随机密钥）
+# 2. 准备配置（compose 挂载 ./config，缺 config/config.json 容器起不来）
+mkdir -p config auths data
+cp config.example.json config/config.json
+#    建议编辑 config/config.json 设置 api_key（或留空由程序自动生成随机密钥）
 
-# 3. 启动（首次会构建镜像，约 1-2 分钟）
-docker compose up -d --build
+# 3. 属主对齐：容器以 uid 10001 运行，属主不对会 permission denied
+sudo chown -R 10001:10001 config auths data
 
-# 4. 健康检查（无可用账号时返回 503）
+# 4. 启动（默认直接拉 GHCR 预构建镜像，无需本地构建）
+docker compose up -d
+
+# 5. 健康检查（无可用账号时返回 503）
 curl -s http://localhost:7863/healthz
 # {"healthy":0,"total":0,"service":"workbuddy2api"}
 ```
@@ -370,39 +405,6 @@ curl -s http://localhost:7863/healthz
 docker compose logs -f          # 跟踪日志
 docker compose restart          # 重启
 docker compose down             # 停止并移除容器（数据在 ./auths 与 ./data，不受影响）
-```
-
-### 方式二：Windows 单文件运行（无需 Docker）
-
-```powershell
-# 1) 下载 Release 中的 wb2api.exe，或从源码构建
-go build -trimpath -ldflags="-s -w" -o wb2api.exe ./cmd/server
-
-# 2) 直接运行：首次启动自动生成 config.json（含随机 api_key，日志打印一次）
-.\wb2api.exe -config config.json
-
-# 3) 浏览器打开面板添加账号
-#    http://127.0.0.1:7863/panel/
-```
-
-exe 为**单文件自包含**（前端资源已 embed 进二进制），拷到任意 Windows 机器即可运行，只需保证 `auths/`（凭证）与 `data/`（状态）目录可写。
-
-### 方式三：源码运行（开发调试）
-
-```bash
-go build ./...
-go vet ./...
-go test ./...                      # 完整测试套件
-go run ./cmd/server -config config.json
-```
-
-构建全部二进制：
-
-```bash
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o wb2api ./cmd/server
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o signin_bin ./cmd/signin
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o login ./cmd/login
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 ```
 
 ### 添加账号（登录）
@@ -829,9 +831,9 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 ### 3. 发布来源与合规边界
 
-- **无预编译 release**：仓库无 Release / tag，产物 = 源码自构建（Dockerfile 多阶段在本地构建时完成）
+- **镜像即产物**：`ghcr.io/JACKY199503/workbuddy2api-panel-plus:latest`（linux/amd64），push 到 `main` 时由 GitHub Actions 自动构建；仓库**无 Release / 无预编译二进制**，不要去找 exe
+- 想自己编译：`docker build -t wb2api .`（或把 compose 里 `image:` 注释掉、放开 `build: .`）；宿主机无需 Go
 - 登录 / 签到 / 积分工具：`./login.sh` / `./signin.sh` / `./credit.sh`
-- **无产物校验和**：`go.sum` 仅约束 Go 模块依赖；Docker 镜像由本地 `docker compose build` 生成，未引用第三方镜像
 - 上游 CodeBuddy 属腾讯系商业产品，本项目是其**非官方 OpenAI 兼容网关**；使用其账号做 API 网关涉及目标平台服务条款与账号风险，作者不对账号封禁、条款违约或使用结果负责
 
 ### 4. 授权使用边界
