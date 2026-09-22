@@ -53,3 +53,7 @@ tools/snapshots/
 !docs/*.md
 !tests/
 !tests/*.md
+
+# go:embed 资源必须进库（上面的 *.md 会把它们一起忽略掉，缺了编译不过）
+!internal/prompt/defaultprompt.md
+!internal/**/*.md
