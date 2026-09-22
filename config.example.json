@@ -1,0 +1,71 @@
+{
+  "listen": ":7863",
+  "api_key": "test_key",
+  "auth_dir": "./auths",
+  "state_file": "./data/state.json",
+  "cooldown": {
+    "soft_rate": "600s",
+    "soft_rate_max": "2h"
+  },
+  "schedule": {
+    "checkin_hours": [9, 21],
+    "travel_hours": [9, 21],
+    "activity_hours": [10],
+    "keepalive_hours": [22],
+    "blackcat_hours": [23],
+    "checkin_enabled": true,
+    "travel_enabled": true,
+    "activity_enabled": true,
+    "keepalive_enabled": true,
+    "blackcat_enabled": true,
+    "balance_refresh_enabled": true,
+    "balance_refresh_minutes": 5
+  },
+  "global": {
+    "enabled": true,
+    "chat_base": "",
+    "billing_base": ""
+  },
+  "upstream": {
+    "timeout_seconds": 120,
+    "header_timeout_seconds": 120,
+    "idle_timeout_seconds": 300,
+    "user_agent": "",
+    "client_version": "",
+    "cli_version": "",
+    "client_name": "",
+    "device_token": "",
+    "device_token_file": "",
+    "passthrough_ip": false
+  },
+  "features": {
+    "sanitize_blacklist_fingerprints": true
+  },
+  "prompt": {
+    "mode": "passthrough",
+    "file": ""
+  },
+  "upstash": {
+    "url": "",
+    "token": ""
+  },
+  "pool": {
+    "max_in_flight": 3,
+    "max_in_flight_global": 2,
+    "breaker_threshold": 3,
+    "breaker_cooldown": "30m",
+    "breaker_cooldown_max": "6h",
+    "degrade_threshold": 5,
+    "degrade_cooldown": "10m",
+    "degrade_cooldown_max": "2h",
+    "idle_weight_per_hour": 0.5,
+    "idle_weight_max": 5.0,
+    "expiring_soon": "168h",
+    "cost_explore_interval": "30m"
+  },
+  "session_sticky": {
+    "enabled": true,
+    "ttl": "30m",
+    "gc_interval": "5m"
+  }
+}

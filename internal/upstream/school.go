@@ -1,0 +1,287 @@
+// school.go 开学季活动（school-season，活动期 2026-09-13 ~ 09-24）纯 API 自动化。
+//
+// 判据（2026-09-13 小程序 MCP 逆向 + 三账号实测，protocol.md §7.11）：
+//   - share_invite（每日 +100c +1抽奖）：POST /tasks/share-complete {channel:"wechat"}
+//     即点亮——纯前端上报，服务端不校验真实分享回执。本模块的主目标。
+//   - chat_3_times / expert_use：判据绑定小程序原生沙箱会话（e2b runtime），
+//     webchat 普通会话不计数，纯 API 不做（需小程序内人工对话）。
+//   - 抽奖：POST /wheel/draw {draw_uuid}（前端生成 uuid，消耗 1 chance）。
+//
+// 端点基址 www.codebuddy.cn（billing 同域）；信封 {code,msg,data}，code=0 成功。
+package upstream
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+)
+
+const schoolBase = "/portal/activity/school"
+
+// schoolJSON 学院活动 API 请求（剥信封，业务 code≠0 返回带 msg 的 error）。
+func (c *Client) schoolJSON(a *auth.Auth, method, path string, body map[string]any, out any) error {
+	var raw []byte
+	if body != nil {
+		raw, _ = json.Marshal(body)
+	}
+	req, err := http.NewRequest(method, c.billingBase(a)+schoolBase+path, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	if a.UID != "" {
+		req.Header.Set("X-User-Id", a.UID)
+	}
+	data, err := c.doJSON(req)
+	if err != nil {
+		return err
+	}
+	if out != nil {
+		return json.Unmarshal(data, out)
+	}
+	return nil
+}
+
+// SchoolTask 开学季任务条目。
+type SchoolTask struct {
+	TaskCode    string `json:"task_code"`
+	Status      string `json:"status"` // pending | completed | claimed
+	Progress    int    `json:"progress"`
+	TargetCount int    `json:"target_count"`
+}
+
+// SchoolTasks 任务列表 + 活动是否在期。
+func (c *Client) SchoolTasks(a *auth.Auth) ([]SchoolTask, bool, error) {
+	var out struct {
+		Tasks    []SchoolTask `json:"tasks"`
+		InPeriod bool         `json:"in_period"`
+	}
+	if err := c.schoolJSON(a, http.MethodGet, "/tasks", nil, &out); err != nil {
+		return nil, false, err
+	}
+	return out.Tasks, out.InPeriod, nil
+}
+
+// SchoolShareComplete 上报「分享完成」（share_invite 判据，实测即点亮）。
+func (c *Client) SchoolShareComplete(a *auth.Auth) error {
+	return c.schoolJSON(a, http.MethodPost, "/tasks/share-complete",
+		map[string]any{"channel": "wechat"}, nil)
+}
+
+// SchoolTaskViewed 标记任务已查看（pending → in_progress）。desktop_chat_1_time
+// 等任务的计数前置：必须先激活（in_progress）后的行为才计数（三账号实测）。
+func (c *Client) SchoolTaskViewed(a *auth.Auth, taskCode string) error {
+	return c.schoolJSON(a, http.MethodPost, "/tasks/"+taskCode+"/viewed", map[string]any{}, nil)
+}
+
+// SchoolClaimTask 领取任务奖励（返回获得的抽奖次数）。
+func (c *Client) SchoolClaimTask(a *auth.Auth, taskCode string) (chanceGranted int, err error) {
+	var out struct {
+		ChanceGranted int `json:"chance_granted"`
+	}
+	if err := c.schoolJSON(a, http.MethodPost, "/tasks/"+taskCode+"/claim", map[string]any{}, &out); err != nil {
+		return 0, err
+	}
+	return out.ChanceGranted, nil
+}
+
+// SchoolChances 当前抽奖次数余额。
+func (c *Client) SchoolChances(a *auth.Auth) (int, error) {
+	var out struct {
+		Chance struct {
+			Balance int `json:"balance"`
+		} `json:"chance"`
+	}
+	if err := c.schoolJSON(a, http.MethodGet, "/config", nil, &out); err != nil {
+		return 0, err
+	}
+	return out.Chance.Balance, nil
+}
+
+// SchoolDraw 抽奖一次，返回奖品描述（prize_code + 积分）。
+func (c *Client) SchoolDraw(a *auth.Auth) (string, error) {
+	var out struct {
+		PrizeCode    string `json:"prize_code"`
+		CreditAmount int    `json:"credit_amount"`
+	}
+	if err := c.schoolJSON(a, http.MethodPost, "/wheel/draw",
+		map[string]any{"draw_uuid": clientToken()}, &out); err != nil {
+		return "", err
+	}
+	if out.CreditAmount > 0 {
+		return fmt.Sprintf("%s +%dc", out.PrizeCode, out.CreditAmount), nil
+	}
+	return out.PrizeCode, nil
+}
+
+// ---- 开学季 chat_3_times / expert_use（2026-09-14 判据破解）----
+// 判据 = v2/report 埋点计数（与成长任务同一事件管道，三账号实测）：
+//   - chat_3_times：3 条 chat_request_send 即 3/3（conversationId 任意、桌面/mp
+//     头族均可计数，无需真实沙箱会话）。
+//   - expert_use：mp 指纹事件链 expert_summon_click + expert_summoned +
+//     expert_actual_use + chat_request_send（开学季分类专家）即点亮。
+
+const mpReportPath = "/v2/report"
+
+// schoolOpenDayActivityID 开学季/校园日活动 id（事件 activityId 字段值，两域共用）。
+const schoolOpenDayActivityID = "school_open_day_2026"
+
+// mpEventBase 小程序埋点公共指纹（appservice wQ()+Ao() 对齐）。
+func mpEventBase(a *auth.Auth) map[string]any {
+	return map[string]any{
+		"timestamp":    time.Now().UnixMilli(),
+		"ideType":      "WorkBuddy_MP",
+		"ideVersion":   "2.4.0",
+		"extName":      "workbuddy-mp",
+		"extVersion":   "2.4.0",
+		"product":      "SaaS",
+		"ideName":      "wx_app_cloud",
+		"platform":     "mini_program",
+		"os":           "windows",
+		"osVersion":    "11",
+		"arch":         "x64",
+		"machineId":    "0655736a-607f-4d9d-b430-58176ee9a090",
+		"timezone":     "Asia/Shanghai",
+		"userId":       a.UID,
+		"userNickname": a.Nickname,
+	}
+}
+
+// ReportMPEvent 以小程序指纹向 www.codebuddy.cn/v2/report 批量上报事件。
+func (c *Client) ReportMPEvent(a *auth.Auth, events ...map[string]any) error {
+	if len(events) == 0 {
+		return fmt.Errorf("mp report: no events")
+	}
+	base := mpEventBase(a)
+	arr := make([]map[string]any, 0, len(events))
+	for _, ev := range events {
+		m := map[string]any{}
+		for k, v := range base {
+			m[k] = v
+		}
+		for k, v := range ev {
+			m[k] = v
+		}
+		arr = append(arr, m)
+	}
+	raw, err := json.Marshal(arr)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, c.BillingBaseCN+mpReportPath, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	if a.UID != "" {
+		req.Header.Set("X-User-Id", a.UID)
+	}
+	req.Header.Set("X-Client-Product", "workbuddy-mp")
+	req.Header.Set("X-Client-Version", "2.4.0")
+	req.Header.Set("X-Client-Platform", "mp-weixin")
+	req.Header.Set("X-Platform", "wechatmp")
+	_, err = c.doJSON(req)
+	return err
+}
+
+// SchoolChatTimesEvents 构造一条 chat_request_send 事件（chat_3_times 计数）。
+func SchoolChatTimesEvents(conversationID string) map[string]any {
+	rid := "wb2api-" + clientToken()
+	return map[string]any{
+		"eventCode":   "chat_request_send",
+		"inputLength": 14, "isPlan": false, "isAutoExecuteTerminal": false,
+		"isAutoModify": false, "codebaseEnable": false, "maxToken": 0,
+		"maxSteps": 500, "temperature": 0, "maxRetries": 0,
+		"mentionContexts": []any{}, "knowledgeId": []any{}, "knowledgeName": []any{},
+		"codebaseId": "", "mentionContextCount": 0, "command": "",
+		"recommendId": "", "skillId": "", "skillCount": 0, "totalCount": 0,
+		"traceId": rid, "rootRequestId": rid,
+		"parentConversationId": conversationID, "conversationId": conversationID,
+		"messageId": "msg-" + rid[len(rid)-8:],
+		"agentName": "mp", "agentType": "main",
+		"codebuddy.session_id":              conversationID,
+		"codebuddy.conversation_request_id": rid,
+	}
+}
+
+// SchoolSeasonChatEvent 构造 growth 域「校园日」（school_season）判据事件：
+// mini 指纹 chat_request_send + activityId=school_open_day_2026（与 school 域
+// 开学季同 activityId 关联；实测无 activityId 的事件不点亮）。事件形状与
+// SchoolChatTimesEvents 同构（school 域 chat_3_times 同款），仅追加 activityId。
+func SchoolSeasonChatEvent(conversationID string) map[string]any {
+	ev := SchoolChatTimesEvents(conversationID)
+	ev["activityId"] = schoolOpenDayActivityID
+	return ev
+}
+
+// SchoolExpertUseEvents 构造专家召唤+对话事件链（expert_use 判据，三账号实测）。
+// expertID/expertName 为开学季分类专家（16-BackToSchool）。
+func SchoolExpertUseEvents(expertID, expertName, conversationID string) []map[string]any {
+	rid := "wb2api-" + clientToken()
+	return []map[string]any{
+		{
+			"eventCode": "expert_summon_click", "id": expertID, "name": expertID,
+			"expertTitle": expertName, "type": "16-BackToSchool", "position": 0,
+		},
+		{
+			"eventCode": "expert_summoned", "id": expertID, "name": expertID,
+			"expertTitle": expertName,
+		},
+		{
+			"eventCode": "expert_actual_use", "id": expertID, "name": expertID,
+			"expertTitle": expertName, "type": "16-BackToSchool",
+			"characterCount": 14, "expertType": "builtin",
+		},
+		{
+			"eventCode":   "chat_request_send",
+			"inputLength": 14, "isPlan": false, "isAutoExecuteTerminal": false,
+			"isAutoModify": false, "codebaseEnable": false, "maxToken": 0,
+			"maxSteps": 500, "temperature": 0, "maxRetries": 0,
+			"mentionContexts": []any{}, "knowledgeId": []any{}, "knowledgeName": []any{},
+			"codebaseId": "", "mentionContextCount": 0, "command": "",
+			"recommendId": "", "skillId": "", "skillCount": 0, "totalCount": 0,
+			"traceId": rid, "rootRequestId": rid,
+			"parentConversationId": conversationID, "conversationId": conversationID,
+			"messageId": "msg-" + rid[len(rid)-8:],
+			"agentName": "mp", "agentType": "main",
+			"expertId": expertID, "expertName": expertName,
+			"codebuddy.session_id":              conversationID,
+			"codebuddy.conversation_request_id": rid,
+		},
+	}
+}
+
+// ---- 我的券码（#/prizes?tab=vouchers，2026-09-16 接入）----
+
+// SchoolVoucher 开学季抽奖抽中的第三方券（KFC/瑞幸/酷狗等）。
+// 字段结构按真实响应样本：GET /vouchers 单次拉全（无分页），data.items[]。
+type SchoolVoucher struct {
+	GrantID   int64  `json:"grant_id"`
+	DrawUUID  string `json:"draw_uuid,omitempty"`
+	SKUCode   string `json:"sku_code,omitempty"`   // kfc_ice_cream / voucher_luckin / voucher_kugou …
+	PrizeName string `json:"prize_name,omitempty"` // 肯德基冰淇淋
+	Code      string `json:"code"`                 // 券码本体（复制给店员核销）
+	ValidFrom string `json:"valid_from,omitempty"` // 上游常为空
+	ValidTo   string `json:"valid_to,omitempty"`   // "2026-10-24"
+	GrantedAt string `json:"granted_at,omitempty"` // RFC3339
+}
+
+// SchoolVouchers 查询账号的开学季券码列表（只读）。
+// 抽到积分的记录不在此端点（那是 /rewards 的 type=credit 条目）。
+func (c *Client) SchoolVouchers(a *auth.Auth) ([]SchoolVoucher, error) {
+	var out struct {
+		Items []SchoolVoucher `json:"items"`
+	}
+	if err := c.schoolJSON(a, http.MethodGet, "/vouchers", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}

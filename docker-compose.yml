@@ -1,0 +1,28 @@
+services:
+  wb2api:
+    # 默认直接用发布好的镜像，开箱即用；想自己编译源码把下面一行换成 build: .
+    image: ${IMAGE:-ghcr.io/JACKY199503/workbuddy2api-panel-plus:latest}
+    # build: .
+    container_name: workbuddy2api
+    entrypoint: ['/app/wb2api', '-config', '/app/config/config.json']
+    restart: unless-stopped
+    # 容器默认以 app 用户（uid 10001）运行。宿主机挂载目录属主不同会导致
+    # 「写入 auths/*.json.tmp 失败 permission denied」，三种解法任选：
+    #   1) 非 root · 让容器以你自己的 uid 运行（挂载目录本来就是你建的）：
+    #      PUID=$(id -u) PGID=$(id -g) docker compose up -d
+    #      或写进 .env 文件：PUID=1000 / PGID=1000
+    #   2) sudo chown -R 10001:10001 ./auths ./data ./config
+    #   3) user: "0:0" 以 root 运行（省事但容器逃逸面更大，自担）
+    user: "${PUID:-10001}:${PGID:-10001}"
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      - "7863:7863"
+    volumes:
+      - ./auths:/app/auths
+      - ./data:/app/data
+      # 注意：宿主机必须先有 config/config.json（cp config.example.json config/config.json）。
+      # 缺失时 Docker 会把挂载点创建成目录 → 容器启动失败（程序会自动生成配置，
+      # 但前提是它能以文件形式写入 —— 挂载目录会挡住这条路径）。
+      # 不挂 :ro：面板「配置」页需要写回此文件（保存后热生效）。
+      - ./config:/app/config
