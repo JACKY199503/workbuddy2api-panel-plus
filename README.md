@@ -246,7 +246,7 @@ Claude Code 直接把 `ANTHROPIC_BASE_URL` 指到网关即可（`http://HOST:786
 | Web 管理面板（账号池 / 模型档位 / 在线改配置 / 日志） | [上游 README · Web 管理面板](https://github.com/linguo2625469/workbuddy2api-panel#readme) |
 | 完整配置项速查、环境变量覆盖、API 端点、错误分类 | [上游 README · 配置说明](https://github.com/linguo2625469/workbuddy2api-panel#readme) |
 
-增强注入点自检（合并上游后确认三项增强没被冲掉）：`bash tools/check-enhancements.sh`。
+合并上游新版本后，用 `git diff` 对照 `internal/apikeys/`、`internal/autoroute/`、`internal/server/compat*.go` 与 `internal/panel/keys.go` 四项，即可确认三项增强没被冲掉。
 
 ---
 

@@ -45,14 +45,11 @@ docs/
 *.zip
 server.exe
 
-# 快照产物（tools/*.sh 进库，快照本身不进）
-tools/snapshots/
-
-# 本地回归脚本与验收手册：只在本机工作区跑，不进仓库
-# （源码副本在工作区根目录 tests/ 之外，结论沉淀在桌面《运维速查》《验收标准》）
+# 本地运维/回归脚本与验收手册：只在本机与服务器上跑，不进仓库
+# 判据：上游 linguo2625469/workbuddy2api-panel 只有 scripts/，没有 tools/、docs/、tests/
+/tools/
 /tests/
 /docs/
-tools/t_compat.py
 
 # go:embed 资源必须进库（上面的 *.md 会把它们一起忽略掉，缺了编译不过）
 !internal/prompt/defaultprompt.md
