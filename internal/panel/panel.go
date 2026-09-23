@@ -425,7 +425,7 @@ func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	reason := "手动停用（面板）"
+	reason := "手动停用"
 	if st.Cooling && st.Reason != "" {
 		reason = "手动停用（原：" + st.Reason + "）"
 	}
