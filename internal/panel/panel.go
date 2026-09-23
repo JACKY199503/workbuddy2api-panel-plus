@@ -413,15 +413,25 @@ func (p *Panel) accountRevive(w http.ResponseWriter, r *http.Request) {
 }
 
 // accountDisable 人工禁用（不再参与选号，需面板 revive 或重登恢复）。
+//
+// 原因文案用中文（与页面其余状态文案一致），并在禁用前把账号当时的冷却原因并进去：
+// Disable 会清冷却域（until/reason 一并归零），一个因「余额不足」硬冷却到次日 04:00 的
+// 号被人工停用后，原本的死因会被抹掉，运维只剩一句「手动停用」看不出它其实也缺积分。
+// 保留原因为「手动停用（原：余额不足）」，复活后要不要先补签到一眼可判。
 func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	if _, ok := p.cfg.Pool.Status(uid); !ok {
+	st, ok := p.cfg.Pool.Status(uid)
+	if !ok {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	p.cfg.Pool.Disable(uid, "manual disable (panel)")
-	log.Printf("panel: disable uid=%s（人工禁用）", uid)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	reason := "手动停用（面板）"
+	if st.Cooling && st.Reason != "" {
+		reason = "手动停用（原：" + st.Reason + "）"
+	}
+	p.cfg.Pool.Disable(uid, reason)
+	log.Printf("panel: disable uid=%s（人工禁用，原因=%s）", uid, reason)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "reason": reason})
 }
 
 // accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
