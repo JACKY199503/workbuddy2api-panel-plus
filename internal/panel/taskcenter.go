@@ -51,6 +51,13 @@ func growthPending(t upstream.Task) bool {
 	if t.Claimed {
 		return false
 	}
+	// 上游锁定的任务不出待办：Sequential 族每日零点解锁一环，刚做完上一环时
+	// 下一环以下发但 locked 形态出现在列表里——扫进队列只会 accept 不落账报
+	// 失败（每日锁定窗口），零点解锁后自然回到待办。其余 locked（上游未开放）
+	// 同语义：不该被自动化尝试。
+	if t.Locked {
+		return false
+	}
 	if t.Target > 0 && t.Current >= t.Target {
 		return false // 达标未领：也入队（队列执行后会自动领）
 	}

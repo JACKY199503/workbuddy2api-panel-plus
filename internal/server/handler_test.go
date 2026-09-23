@@ -581,6 +581,37 @@ func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {
 	}
 }
 
+func TestChat429Code14018UsesHardCreditCooldown(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-bad" {
+			return 429, `{"code":14018,"msg":"Credits exhausted"}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000, 2000)
+	p.SetCredits("good", 1000, 1000)
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	st, ok := p.Status("bad")
+	if !ok || !st.Cooling {
+		t.Fatalf("14018 account should be cooling: %+v ok=%v", st, ok)
+	}
+	if st.Reason != "余额不足" || st.Until.Hour() != 4 {
+		t.Fatalf("14018 should use hard-credit cooldown, got reason=%q until=%v", st.Reason, st.Until)
+	}
+	if got := p.Pick(); got == nil || got.UID != "good" {
+		t.Fatalf("hard-cooled 14018 account must not be fallback-picked, got %+v", got)
+	}
+}
+
 // TestChat6004ModelResetCoolsToParsedTime 端到端回归 issue #31：上游 429 + code 6004
 // +「将在 … 重置」→ 冷却 until 精确等于解析时间（而非 600s 固定基数/指数退避），
 // 且记录触发模型 → 同模型请求仍被冷却、切模型请求按豁免可选。

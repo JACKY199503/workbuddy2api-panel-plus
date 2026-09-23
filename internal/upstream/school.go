@@ -222,6 +222,72 @@ func SchoolSeasonChatEvent(conversationID string) map[string]any {
 	return ev
 }
 
+// MiniExpertUseEvent 构造 growth 域 Sequential_Tasks_2「在小程序内选中专家并完成
+// 有效对话」的判据事件：mp 指纹 expert_actual_use。形状对齐小程序源码
+// app-service.js 的真实发射点（上游 task_runner 实测 2026-09-23：上报即 completed，
+// claim +200c+5e）。与 school 域的 SchoolExpertUseEvents 是**两套口径**，勿照抄：
+//   - 不带 conversationId/activityId——真实事件就是这两个字段都不带；
+//   - extVersion 用小程序自身版本 2.2.8（覆盖 mpEventBase 的 2.4.0）；
+//   - source=mini_program + type 固定 "send_message"（小程序恒发此值）。
+//
+// expertID 必须是专家市场真实 ex_ id（ListMarketExperts），空 id 服务端不入账。
+func MiniExpertUseEvent(expertID, expertName, expertType string) map[string]any {
+	if expertType == "" {
+		expertType = "agent"
+	}
+	if expertName == "" {
+		expertName = expertID
+	}
+	return map[string]any{
+		"eventCode": "expert_actual_use", "reportDelay": 0,
+		"extVersion": "2.2.8", "source": "mini_program",
+		"id": expertID, "name": expertID,
+		"expertTitle": expertName, "type": "send_message",
+		"characterCount": 12, "expertType": expertType,
+	}
+}
+
+// MiniChatModelEvent mp 对话事件 + 模型字段（Sequential_Tasks_5「使用 GLM5.2」判据
+// 载体）：小程序 chat_request_send 真实发射点（mpsrc main 32904 模块）带
+// requestModelId / requestModelName——Tasks_1/3 的裸对话事件不带模型，模型任务
+// 须用本形态（判据待解锁实测验证）。
+func MiniChatModelEvent(conversationID, modelID, modelName string) map[string]any {
+	ev := SchoolChatTimesEvents(conversationID)
+	ev["requestModelId"] = modelID
+	ev["requestModelName"] = modelName
+	return ev
+}
+
+// MiniPlaybookEvents mp 指纹灵感事件组（Sequential_Tasks_7「体验灵感功能」判据
+// 载体，形状对齐 mpsrc main 73640/73665 发射点：playbook_cta_click →
+// playbook_prompt_send）。issue #42 称该任务为 PC 口径（+500c+5e）——PC 序列
+// （DesktopPlaybookPromptSequence）已实测点亮 playbook_prompt，本组作为 mp 形态
+// 补充（任务在 mp 链上，判据究竟认哪侧待解锁实测）。
+func MiniPlaybookEvents(caseID, caseName string) []map[string]any {
+	base := map[string]any{
+		"id": caseID, "name": caseName, "type": "document",
+		"categoryId": "", "categoryName": "",
+		"skills": "", "skillNames": "",
+	}
+	cta := map[string]any{
+		"eventCode": "playbook_cta_click", "source": "discover", "position": 1,
+		"extVersion": "2.2.8",
+	}
+	for k, v := range base {
+		cta[k] = v
+	}
+	send := map[string]any{
+		"eventCode": "playbook_prompt_send", "source": "discover",
+		"promptLength": 96, "isOfficial": 1,
+		"conversationId": "wb2api-mp-pb-" + clientToken(),
+		"extVersion":     "2.2.8",
+	}
+	for k, v := range base {
+		send[k] = v
+	}
+	return []map[string]any{cta, send}
+}
+
 // SchoolExpertUseEvents 构造专家召唤+对话事件链（expert_use 判据，三账号实测）。
 // expertID/expertName 为开学季分类专家（16-BackToSchool）。
 func SchoolExpertUseEvents(expertID, expertName, conversationID string) []map[string]any {

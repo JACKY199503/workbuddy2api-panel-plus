@@ -49,6 +49,15 @@ func TestClassify(t *testing.T) {
 		{400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, ErrBadParams},
 		{400, `Unmarshal chat params failed`, ErrBadParams},
 		{400, `{"code":11101,"msg":"x"}`, ErrBadParams},
+		// 图片格式/数据错误是确定性请求错误，分类后不轮转、不罚号。
+		{400, `{"code":11101,"msg":"Parse message failed: invalid image_url content at index 2: json: cannot unmarshal string into Go value of type v2.ImageContent"}`, ErrImageInvalid},
+		{400, `{"code":11135,"msg":"invalid_image_data"}`, ErrImageInvalid},
+		{400, `invalid_image_data`, ErrImageInvalid},
+		// 11135 业务码须容忍 JSON 空白（5d5223d：字面量 marker 只覆盖紧凑形态）。
+		{400, `{"code": 11135, "msg":"image data invalid"}`, ErrImageInvalid},
+		{400, `{"error":{"code": "11135", "message":"image invalid"}}`, ErrImageInvalid},
+		// 防过宽：11133（模型不支持图片）不进 image_invalid。
+		{400, `{"code": 11133, "msg":"model does not support image"}`, ErrClient},
 		{200, `quota exceeded`, ErrHardCredit},
 		// session 死亡优先于限流文案（401+12153 需人工重登，短冷却无意义）。
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},
@@ -58,6 +67,48 @@ func TestClassify(t *testing.T) {
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
 		{200, ``, ErrNone},
+		// 11102「该后端无此模型」：确定性答复，归 ErrModelBlocked（(账号,模型) 负缓存避让）。
+		{404, `{"code":11102,"msg":"model [deepseek-v3-2-volc] service info not found"}`, ErrModelBlocked},
+		{400, `{"error":{"code":"11102","message":"model service info not found"}}`, ErrModelBlocked},
+		{400, `{"msg":"service info not found"}`, ErrModelBlocked},
+		// 11102 撞在 requestId 上不算（不得误避让可用模型）。
+		{404, `{"requestId":"11102","msg":"ok"}`, ErrNotFound},
+		// 429 + 11102 → 限流语义（ErrSoftRate），不是模型不存在。
+		{429, `{"code":11102,"msg":"service info not found"}`, ErrSoftRate},
+		// 429 + 余额措辞 → 限流语义（fork-scan-absorb T-3，本次修复点）：限流响应
+		// body 高频携带 "quota exceeded"/"额度不足" 等跨计费/限流两界的措辞，
+		// hardRule 在 429 之前会误判 ErrHardCredit 硬冷却到次日 04:00，白扔号约 12h。
+		// 状态码是比关键词更权威的信号：真余额耗尽走 402，非 429 的 quota 措辞
+		// 仍归 hardRule（上方 {200,"quota exceeded"} 语义不变）。
+		{429, `quota exceeded`, ErrSoftRate},
+		{429, `{"code":1,"msg":"quota exceeded, please wait"}`, ErrSoftRate},
+		{429, `insufficient credits`, ErrSoftRate},
+		{429, `{"code":1,"msg":"额度不足"}`, ErrSoftRate},
+		{429, `积分不足，请充值`, ErrSoftRate},
+		// 429 + 账号级故障码防回归（accountFault 仍先于 429 判定）：429+14017 若
+		// 落到 status==429 兜底会误归 soft_rate，账号级故障等不来自愈。
+		{429, `{"code":14017,"msg":"trial not activated"}`, ErrAccountFault},
+		{429, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, ErrAccountFault},
+		// Issue #175：14018 明确表示账号积分耗尽，即使 HTTP 状态是 429 也必须
+		// 走硬积分冷却；仅有相同文案而无该业务码的普通 429 仍保持软限流。
+		{429, `{"code":14018,"msg":"Credits exhausted"}`, ErrHardCredit},
+		{429, `{"error":{"data":{"code":"14018","msg":"Credits exhausted"}}}`, ErrHardCredit},
+		{429, `{"requestId":"14018","msg":"Credits exhausted"}`, ErrSoftRate},
+		{429, `{"code":1,"msg":"Credits exhausted"}`, ErrSoftRate},
+		// WAF 403（P0-1）：403 + 无业务信封（无 "code":/"msg": 字段）→ ErrWafBlock。
+		// 空体 / HTML 拦截页 / 纯文本 / 非信封 JSON 均命中。
+		{403, ``, ErrWafBlock},
+		{403, `<html><body>403 Forbidden</body></html>`, ErrWafBlock},
+		{403, `Forbidden`, ErrWafBlock},
+		{403, `{"message":"blocked by waf"}`, ErrWafBlock},
+		{403, `<head><script>...</script></head><body>blocked</body>`, ErrWafBlock},
+		// 403 带业务信封的仍走既有分类（P0-1 约束：不劫持业务 403）。
+		{403, `{"code":11128,"msg":"blocked by security policy"}`, ErrContentBlocked},
+		{403, `{"code":60001,"msg":"quota exceeded"}`, ErrHardCredit},
+		{403, `{"code":1,"msg":"unknown business error"}`, ErrClient},
+		// 非 403 的无信封错误体不进 WAF 分类（WAF 判定绑定 403 形态）。
+		{400, `bad request`, ErrClient},
+		{429, ``, ErrSoftRate},
 	}
 	for _, c := range cases {
 		if got := Classify(c.status, c.body); got != c.want {

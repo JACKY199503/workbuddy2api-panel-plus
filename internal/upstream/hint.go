@@ -45,6 +45,8 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 	switch kind {
 	case ErrPromptTooLong:
 		return "request context exceeds the model's limit; reduce history/message size"
+	case ErrImageInvalid:
+		return "image request was rejected by upstream; check image_url format and image data"
 	case ErrWafBlock:
 		// 账号级 WAF 403 与 IP 级 fail-fast 同 hint：两者对客户端的动作一致
 		// （等待窗口过去再试，换号/立刻重试无意义）。

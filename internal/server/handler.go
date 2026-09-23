@@ -280,11 +280,14 @@ var dynamicModelsCache struct {
 }
 
 const (
-	dynamicModelsTTL        = time.Hour
+	// dynamicModelsTTL 模型目录缓存时长。曾是 1h；缩到 10min 对齐「面板实时、
+	// API 缓存」的漂移痛点（PR #38 报告）：目录新增模型时面板立即可见，公开
+	// /v1/models 最多滞后一个 TTL。再短就不值得——每次失效都是 2 次上游探测。
+	dynamicModelsTTL        = 10 * time.Minute
 	modelsFetchFailCooldown = 5 * time.Minute
 )
 
-// models 返回模型列表：纯动态（缓存 1h），失败/无号返回空列表（无静态兜底——
+// models 返回模型列表：纯动态（缓存 10min），失败/无号返回空列表（无静态兜底——
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	data := h.modelList()
@@ -525,9 +528,15 @@ func (h *Handler) fetchGlobalModels() ([]string, *auth.Auth) {
 	return h.cfg.Upstream.FetchGlobalModels(acct), acct
 }
 
-// fetchDynamicModels 从池中任一健康 CN 账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
-// 拉取失败记录时间戳进入 5min 负缓存，冷却期内直接返回 nil（纯动态，无静态表兜底），
-// 避免反复打上游。只从 CN realm 账号拉取（global 走独立探测）。
+// fetchDynamicModels 从第一个可用 CN 账号拉模型列表（含 contextWindow/maxTokens），
+// 缓存 10min。
+// 选号与 /panel/api/models 完全同口径（AvailableUIDsForRealm("cn") 首个 + AuthByUID），
+// 而非 Pool.Pick()：Pick 无 realm 过滤，混合池里可能选中 global 号去打 CN 端点，
+// 表现为偶发失败/面板与 /v1/models 两套目录（PR #38 报告并给出的选号修复）。
+// 缓存 + 5min 负缓存按既有语义**保留**（#38 原案整体删除缓存被拒）：公开端点逐请求
+// 实时拉取 = 每次 2 个上游探测，客户端周期性刷新模型列表会持续打上游；上游故障时
+// 无冷却窗口，客户端重试即放大请求量——负缓存正是为此设计（见 handler_test 吸收
+// 上游 9832283 的注释）；且 cachedModelsSnapshot（gateway_hint 判定）依赖缓存写入。
 func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	dynamicModelsCache.RLock()
 	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
@@ -542,7 +551,11 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	}
 	dynamicModelsCache.RUnlock()
 
-	acct := h.cfg.Pool.Pick()
+	uids := h.cfg.Pool.AvailableUIDsForRealm("cn")
+	if len(uids) == 0 {
+		return nil
+	}
+	acct := h.cfg.Pool.AuthByUID(uids[0])
 	if acct == nil {
 		return nil
 	}
@@ -992,6 +1005,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadRequest
 				return
 			}
+			// 图片格式/数据无效：立即透传上游原文回客户端，不罚号不轮转。
+			// 同一 body 换账号仍是同样的解析结果，轮转只会放大无效请求。
+			if kind == upstream.ErrImageInvalid {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "image request was rejected by upstream"
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "image_invalid", msg,
+					h.hintOf(upstream.ErrImageInvalid, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusBadRequest
+				return
+			}
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 			// 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
@@ -1222,7 +1249,7 @@ func rotateBackoff(i int, ctx context.Context) bool {
 // 此处不再按原始 status 二次判断。仅在 chatCompletions 轮转循环内调用：内容拦截
 // 会立即 400 返回，其余种类 continue 换号（continue 前由 rotateBackoff 退避）。
 //
-// 九条路径，各司其职：
+// 十条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
 //   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
 //     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避。冷却时长优先采信
@@ -1237,6 +1264,9 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //   - ErrBadParams → 不罚账号（同 ErrContentBlocked 待遇），但仍轮转。
 //   - ErrPromptTooLong → 11115：请求的问题不是账号的问题。零动作（不冷却/不熔断/
 //     不 NoteError、不喂连败），chatCompletions 已直接透传原文返回不轮转。
+//   - ErrImageInvalid → 图片格式/数据无效：请求的问题不是账号的问题（同一 body
+//     换任何号都会得到相同的解析错误）。零动作（不冷却/不熔断/不 NoteError、
+//     不喂连败），chatCompletions 已直接透传原文返回不轮转。
 //   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
@@ -1312,6 +1342,9 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 11115「prompt is too long」：请求的问题不是账号的问题（同一 body 换任何
 		// 号都超限）。零动作（不冷却/不熔断/不 NoteError，同 ErrContentBlocked 待遇），
 		// chatCompletions 已直接透传原文返回不轮转——该分支只为文档完备。
+	case upstream.ErrImageInvalid:
+		// 图片格式/数据无效：请求的问题不是账号的问题（同一 body 换任何号都会
+		// 得到相同解析错误）。零动作，chatCompletions 已 fail-fast 透传。
 	case upstream.ErrBadParams:
 		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
 		// 有问题（网关侧不再截断，均为客户端畸形 JSON）。换了账号照样 400，
@@ -1409,7 +1442,7 @@ func hasImagePart(body []byte) bool {
 //
 // 目录查询只读既有缓存快照（cachedModelsSnapshot），**不触发上游拉取**：错误路径
 // 加一次 FetchModels 网络调用既拖慢错误响应、又污染上游调用语义（错误风暴时放大
-// 请求量——与 WAF IP fail-fast 的「不放大请求量」哲学相悖）。缓存冷（最近 1h 未
+// 请求量——与 WAF IP fail-fast 的「不放大请求量」哲学相悖）。缓存冷（最近 10min 未
 // 拉过）→ ModelInCatalog=false，11133 退中性 hint（宁缺勿滥，不编造能力事实）。
 func (h *Handler) hintContext(bareModel string, hasImage bool) upstream.HintContext {
 	ctx := upstream.HintContext{Model: bareModel, HasImage: hasImage}

@@ -71,7 +71,7 @@ func (c *Client) ListTasks(a *auth.Auth) ([]Task, error) {
 // 小程序限定任务（Sequential_Tasks_1「小程序首对话」/ school_season「校园日」等）
 // 仅在该口径下发——默认列表不出现，accept/claim 同样要求该头（缺头 accept 返回
 // task not found，上游 task_runner 实测）。**实测 mp 列表是默认口径的超集**
-//（含 RichMeow/Model_chat 等常规任务 + wb_wechat_oa_subscribe_task 等 mp 专属），
+// （含 RichMeow/Model_chat 等常规任务 + wb_wechat_oa_subscribe_task 等 mp 专属），
 // 合并时调用方须按 task_code 去重。
 func (c *Client) ListTasksMP(a *auth.Auth) ([]Task, error) {
 	data, err := c.growthJSONMP(a, http.MethodGet, tasksListPath, nil)

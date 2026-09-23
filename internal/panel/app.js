@@ -138,7 +138,7 @@ function go(v) {
   if (v === 'keys') loadKeys();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
-  if (v === 'taskscenter') { loadSchoolStatus(true); pollQueueOnce(); }
+  if (v === 'taskscenter') { loadSchoolStatus(true); reattachQueueView(); }
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
 go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accounts').slice(1) : 'accounts');
@@ -315,6 +315,24 @@ function outCell(m, pr) {
   return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ink-3)">?</span><div class="note">未测出' + stale + '</div></td>';
 }
 
+/* rateCell 倍率列：牌价 vs 生效价。上游 credits 是牌价（转正后基准倍率），
+   modelPromotions 给当前生效折扣（限时免费 factor=0 / 夜间五折 0.5 等）——
+   WorkBuddy 客户端显示的正是生效价。有折扣：生效价大字 + 标签 + 划线牌价，
+   悬停带时段说明；无 factor 只有标签（错峰类）：牌价 + 标签。 */
+function rateCell(m) {
+  const tip = m.promo_note ? ' title="' + esc(m.promo_note) + '"' : '';
+  if (m.promo_factor != null && m.promo_credits) {
+    const base = m.credits ? ' <s style="color:var(--ink-3);font-size:11.5px">' + esc(m.credits) + '</s>' : '';
+    const label = m.promo_label ? ' <span class="tag ok">' + esc(m.promo_label) + '</span>' : '';
+    return '<span' + tip + ' style="cursor:help"><b>' + esc(m.promo_credits) + '</b>' + label + base + '</span>';
+  }
+  if (m.promo_label) {
+    return '<span' + tip + ' style="cursor:help">' + (m.credits ? esc(m.credits) : '—') +
+      ' <span class="tag warn">' + esc(m.promo_label) + '</span></span>';
+  }
+  return m.credits ? esc(m.credits) : '—';
+}
+
 async function loadModels() {
   const tb = $('mdBody');
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
@@ -340,7 +358,7 @@ async function loadModels() {
       const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
       const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
       return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
-        '<td class="num">' + (m.credits ? esc(m.credits) : '—') + '</td>' +
+        '<td class="num">' + rateCell(m) + '</td>' +
         '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
         '<td class="efs" style="white-space:normal">' + effs + '</td>' +
         '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
@@ -665,7 +683,7 @@ $('btnRefresh').onclick = async () => {
 function refreshVisible() {
   if (view === 'accounts') loadOverview(true);
   else if (view === 'logs') loadLogs();
-  else if (view === 'taskscenter') pollQueueOnce();
+  else if (view === 'taskscenter') reattachQueueView();
 }
 function start() {
   loadOverview(true);
@@ -704,7 +722,13 @@ const AUTO_TASKS = {
   'Expert_lighthouse': '真实轻量云专家召唤+使用链（真实对话 requestId，两账号实测点亮）',
   'skill_1': '真实对话 + skill_info 技能加载事件（实测点亮）',
   'school_season': '校园日（小程序口径）：accept → mini 对话+activityId 上报 → 领奖（+100c+5e）',
-  'Sequential_Tasks_1': '小程序首对话（小程序口径）：accept → mini 对话上报 → 领奖（+100c+5e）'
+  'Sequential_Tasks_1': '小程序首对话（小程序口径）：accept → mini 对话上报 → 领奖（+100c+5e）',
+  'Sequential_Tasks_2': '小程序选专家对话（小程序口径）：市场专家 id → accept → expert_actual_use 上报 → 领奖（+200c+5e）',
+  'Sequential_Tasks_3': '小程序五次对话（小程序口径）：accept → mini 对话上报 ×5（自动补差额）→ 领奖（+300c+5e）',
+  'Sequential_Tasks_4': '小程序定时任务（预留，每日零点解锁一环）：accept → 定时任务创建事件 → 领奖（判据待解锁验证）',
+  'Sequential_Tasks_5': '小程序使用 GLM5.2（预留）：accept → 带模型字段的 mini 对话上报 → 领奖（判据待解锁验证）',
+  'Sequential_Tasks_6': '小程序十次对话（预留）：accept → mini 对话上报 ×target（自动补差额）→ 领奖',
+  'Sequential_Tasks_7': '体验灵感功能（预留，疑 PC 口径）：accept → 灵感事件组（PC+mp 双形态）→ 领奖（判据待解锁验证）'
 };
 
 function openTasks(uid) {
@@ -1155,6 +1179,9 @@ let queueTimer = null, lastQueueSeq = 0;
 const GROWTH_TITLES = {}; // code → 展示名（扫描时从任务列表带出）
 $('btnScanAll').onclick = async () => {
   const b = $('btnScanAll');
+  // 停掉队列轮询：显式扫描 = 切到待办视图。否则在途队列的下一 tick 会把扫描
+  // 结果冲掉重渲染回队列视图（服务端执行不受影响，只是不再实时回写本视图）。
+  if (queueTimer) { clearInterval(queueTimer); queueTimer = null; }
   b.disabled = true; b.textContent = '扫描中…';
   try {
     const d = await api('tasks/scan_all', { method: 'POST' });
@@ -1249,28 +1276,40 @@ function groupsFromQueue(items) {
   }
   return Array.from(by.values());
 }
-async function pollQueueOnce() {
-  try {
-    const q = await api('tasks/queue');
-    if (!q.started) return;
-    // 只渲染本页启动过的那轮队列（q.running 时也要同代次——刷新页面后不再接管旧队列）。
-    if (lastQueueSeq && q.seq !== lastQueueSeq) return;
-    renderQueue(groupsFromQueue(q.items || []), q);
-  } catch (e) { /* 静默 */ }
-}
 function startQueuePolling() {
   if (queueTimer) clearInterval(queueTimer);
   queueTimer = setInterval(async () => {
-    await pollQueueOnce();
+    let q;
+    try { q = await api('tasks/queue'); } catch (e) { return; }
+    if (!q.started) return;
+    // 只渲染本页启动过的那轮队列（刷新页面后不再接管旧队列）。
+    if (lastQueueSeq && q.seq !== lastQueueSeq) return;
+    if (q.running) {
+      renderQueue(groupsFromQueue(q.items || []), q);
+      return;
+    }
+    // 结束：终态只渲染这一次，随即停表。此后残留的 items（running=false）不再
+    // 回写视图——曾把用户刚点开的「扫描待办」结果在下一个 tick 冲掉。
+    renderQueue(groupsFromQueue(q.items || []), q);
+    clearInterval(queueTimer); queueTimer = null;
+    toast('任务队列执行结束', 'ok');
+    loadSchoolStatus(true);
+  }, 3000);
+}
+// reattachQueueView 切回任务中心视图时恢复队列进度：仅当本页启动的队列仍在
+// 执行才重新开轮询（残留态/别页队列不接管——视图不被旧结果冲掉）。
+function reattachQueueView() {
+  // 全程异步：go() 在顶层（app.js ~143 行）被调用时，本文件下方 let/const
+  //（queueTimer/lastQueueSeq 等）尚未初始化——同步读取即 TDZ ReferenceError
+  // 使整个脚本中断。await 之后才碰它们（旧 pollQueueOnce 正是靠开头的 await
+  // 侥幸安全）。queueTimer 的"已在跑"判定也挪到 await 后，语义不变。
+  (async () => {
     try {
       const q = await api('tasks/queue');
-      if (!q.running) {
-        clearInterval(queueTimer); queueTimer = null;
-        toast('任务队列执行结束', 'ok');
-        loadSchoolStatus(true);
-      }
-    } catch (e) { /* 忽略 */ }
-  }, 3000);
+      if (queueTimer) return; // 轮询已在跑（跨视图不中断）
+      if (q.started && q.running && (!lastQueueSeq || q.seq === lastQueueSeq)) startQueuePolling();
+    } catch (e) { /* 静默 */ }
+  })();
 }
 
 /* ── 用量 ─────────────────────────────────────────────────────────── */

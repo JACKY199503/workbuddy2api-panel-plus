@@ -328,6 +328,18 @@ func panelModelEntry(realm string, mi upstream.ModelInfo, remoteEfforts []string
 		"reasoning_effort":     mi.ReasoningEffort,
 		"reasoning_summary":    mi.ReasoningSummary,
 	}
+	// 限时优惠（modelPromotions）：credits 是牌价，promo_* 是当前生效折扣
+	//（WorkBuddy 客户端显示的就是这个生效价）。前端据此显示「生效价+标签+划线牌价」。
+	if mi.PromoFactor != nil {
+		entry["promo_factor"] = *mi.PromoFactor
+		entry["promo_credits"] = mi.PromoCredits
+	}
+	if mi.PromoLabel != "" {
+		entry["promo_label"] = mi.PromoLabel
+	}
+	if mi.PromoNote != "" {
+		entry["promo_note"] = mi.PromoNote
+	}
 	if mi.MaxAllowedSize > 0 {
 		entry["max_allowed_size"] = mi.MaxAllowedSize
 	}

@@ -944,25 +944,3 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | `internal/panel/keys.go` | 面板密钥管理接口 `/panel/api/keys` |
 
 改动的上游文件：`cmd/server/config.go`（`auto_model` / `model_fallback` / `trust_proxy`）、`cmd/server/main.go`、`internal/server/handler.go`、`internal/server/resolve_model.go`、`internal/livecfg/livecfg.go`、`internal/upstream/client.go`、`internal/upstream/hint.go`、`internal/panel/panel.go`、`internal/panel/app.js`、`internal/panel/index.html`。
-
-## 🔧 维护者说明：本仓库怎么跟随上游升级
-
-> **使用者不用看这节。** 本仓库提交的源码已经是「上游 + 两项增强」的成品，clone / pull 即用。
-> 这节只记录维护者在**上游发布新版后**，如何把增强重新合进源码并推回本仓库。
-
-固化包（`auto.patch` + `files/` + `apply.sh`）是维护者的**本地工具，不进本仓库**，仓库里只放合入后的最终结果，保证开箱即用。
-
-流程（全部在维护者本地服务器 `/opt/wb2api` 上完成）：
-
-| 步骤 | 命令 | 说明 |
-|---|---|---|
-| 0 拍快照 | `bash /opt/wb2api/tools/snapshot.sh` | 留退路，随时可 `tools/restore.sh` 回滚 |
-| 1 拉上游 | `bash /opt/wb2api/tools/upgrade.sh` | 会整体覆盖 `cmd/`、`internal/`，此刻两项增强必丢（属预期） |
-| 2 打回增强 | `bash /opt/wb2api-auto-patch/apply.sh` | 拷回 3 个独有文件 + `patch` 打 10 个上游文件 + 16 项注入点自检 + 重建 + 健康检查，幂等可重跑 |
-| 3 全量验收 | 见 [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md) | 结构自检 + 6 个回归脚本全绿才算合入成功 |
-| 4 推回本仓库 | `git add cmd internal && git commit && git push` | 把**恢复后的源码**提交到 main |
-| 5 自动发镜像 | （GitHub Actions 自动） | push 触发 `.github/workflows/ghcr.yml`，构建并推送 `ghcr.io/JACKY199503/workbuddy2api-panel-plus:latest` |
-
-使用者侧只需 `docker compose pull && docker compose up -d` 就能拿到含增强的新版本；`config/`、`auths/`、`data/` 是挂载目录，配置与已签发的 `wbk_` 密钥都不会丢。
-
-若第 2 步因上游源码变动过大而失败（hunk 失配 / 编译报错），先跑 `bash /opt/wb2api-auto-patch/make_patch.sh` 基于**当前已恢复且功能正常的源码**重新生成 `auto.patch`，再执行 `apply.sh`。

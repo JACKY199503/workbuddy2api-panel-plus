@@ -172,27 +172,34 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 		infos []ModelInfo
 		err   error
 	}
-	v3Ch := make(chan probeResult, 1)
-	enterpriseCh := make(chan probeResult, 1)
-	go func() {
-		// v3 主路：复用 IDE UA 版 /v3/config 探测（chatBase 已按 realm 切 global base）。
-		byID, perr := c.fetchV3ConfigModelMap(a)
-		if perr != nil {
-			v3Ch <- probeResult{err: perr}
-			return
-		}
-		ids := make([]string, 0, len(byID))
-		outInfos := make([]ModelInfo, 0, len(byID))
-		for _, mi := range byID {
-			if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
-				continue
+	// probeV3 单次 /v3/config 探测（UA 参数化）。该端点对不同 UA 下发**不同模型集合**：
+	// IDE UA 与 CLI UA 各有独有模型（见 codeBuddyCLIUA 注释），故并发两路取并集。
+	probeV3 := func(ua string) chan probeResult {
+		ch := make(chan probeResult, 1)
+		go func() {
+			// chatBase 已按 realm 切 global base。
+			byID, perr := c.fetchV3ConfigModelMap(a, ua)
+			if perr != nil {
+				ch <- probeResult{err: perr}
+				return
 			}
-			ids = append(ids, mi.ID)
-			outInfos = append(outInfos, mi)
-		}
-		sort.Strings(ids) // map 迭代序随机，排序保输出稳定
-		v3Ch <- probeResult{names: ids, infos: outInfos}
-	}()
+			ids := make([]string, 0, len(byID))
+			outInfos := make([]ModelInfo, 0, len(byID))
+			for _, mi := range byID {
+				if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
+					continue
+				}
+				ids = append(ids, mi.ID)
+				outInfos = append(outInfos, mi)
+			}
+			sort.Strings(ids) // map 迭代序随机，排序保输出稳定
+			ch <- probeResult{names: ids, infos: outInfos}
+		}()
+		return ch
+	}
+	v3IDECh := probeV3(codeBuddyIDEUA)
+	v3CLICh := probeV3(codeBuddyCLIUA)
+	enterpriseCh := make(chan probeResult, 1)
 	go func() {
 		// 企业端点家族：/v2 首选 → /console 兜底（既有探活序，零回归）。
 		var lastErr error
@@ -207,8 +214,25 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 		}
 		enterpriseCh <- probeResult{err: lastErr}
 	}()
-	v3 := <-v3Ch
+	v3IDE := <-v3IDECh
+	v3CLI := <-v3CLICh
 	enterprise := <-enterpriseCh
+	// v3 两路自合并：IDE 路字段权威（响应更大、单条字段更全），CLI 路只补缺失的模型 id。
+	// 单路成功即用该路；两路全失败才带 err 进入下游降级判断。
+	var v3 probeResult
+	switch {
+	case v3IDE.err != nil && v3CLI.err != nil:
+		v3 = probeResult{err: v3IDE.err}
+	case v3IDE.err != nil:
+		log.Printf("WARN: [upstream] global models: v3/config IDE-UA probe failed (CLI-UA only): %v", v3IDE.err)
+		v3 = v3CLI
+	case v3CLI.err != nil:
+		log.Printf("WARN: [upstream] global models: v3/config CLI-UA probe failed (IDE-UA only): %v", v3CLI.err)
+		v3 = v3IDE
+	default:
+		vn, vi := mergeGlobalCatalog(v3IDE.names, v3IDE.infos, v3CLI.names, v3CLI.infos)
+		v3 = probeResult{names: vn, infos: vi}
+	}
 
 	if v3.err != nil && enterprise.err != nil {
 		// 两路全失败 → 负缓存语义（等价原家族端点全非 2xx）。
