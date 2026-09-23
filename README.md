@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>把腾讯 CodeBuddy 账号变成 OpenAI 兼容 API 的多账号网关 · 附 Web 管理面板</b><br>
-  本仓库在上游之上<b>只新增两项功能</b>：🔑 API 密钥分发 · 🧠 模型编排
+  本仓库在上游之上<b>只新增三项功能</b>：🔑 API 密钥分发 · 🧠 模型编排 · 🔌 协议兼容层
 </p>
 
 <p align="center">
@@ -20,20 +20,20 @@
 
 ## 这是什么
 
-三层 fork，**上游的全部能力一个没动**，只在其上加了密钥分发与模型编排：
+三层 fork，**上游的全部能力一个没动**，只在其上加了密钥分发、模型编排与协议兼容层：
 
 | 层 | 项目 | 说明 |
 |---|---|---|
 | 根项目 | [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) | 账号池调度、错误分类、提示词体系等核心设计 |
 | 直接上游 | [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) | Web 面板与可视化运维层 |
-| **本仓库** | `workbuddy2api-panel-plus` | 上游 + 两项增强 |
+| **本仓库** | `workbuddy2api-panel-plus` | 上游 + 三项增强 |
 
 账号池调度、冷却熔断、定时任务、成长任务、Web 面板等**上游内容本文档不再复述**，直接看上游 README：
 
 - 全部能力与配置细节 → [上游 README](https://github.com/linguo2625469/workbuddy2api-panel#readme)
 - 根项目设计 → [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)
 
-本仓库提交的源码 = 上游功能 + 两项增强，已合并好，`clone` 下来直接就是完整网关 + 面板，不需要先装上游、也不需要先打补丁。
+本仓库提交的源码 = 上游功能 + 三项增强，已合并好，`clone` 下来直接就是完整网关 + 面板，不需要先装上游、也不需要先打补丁。
 
 ---
 
@@ -193,6 +193,47 @@ curl -i http://HOST:7863/v1/chat/completions \
 
 ---
 
+<a id="protocol-compat"></a>
+
+## 🆕 新增三：协议兼容层（`/v1/responses` + `/v1/messages`）
+
+**解决什么问题**：原来网关只认 OpenAI 的 `/v1/chat/completions`。Claude Code 等客户端走的是 Anthropic Messages API（`/v1/messages`），新版 OpenAI SDK / Codex 走的是 Responses API（`/v1/responses`），接上来直接 404。现在两类协议都能直接打进来，复用同一套账号池、密钥分发与模型编排。
+
+| 端点 | 协议 | 说明 |
+|---|---|---|
+| `POST /v1/chat/completions` | OpenAI Chat Completions | 原有接口，行为零变更 |
+| `POST /v1/responses` | **OpenAI Responses API** | `input` 支持字符串或消息数组；`instructions` → system；`max_output_tokens` → `max_tokens`；返回 `{object:"response", output:[...], status, usage}` |
+| `POST /v1/messages` | **Anthropic Messages API** | 标准 `messages` 数组 + `system`（字符串或 block 数组）+ `max_tokens`；返回 `{type:"message", content:[{type:"text"}], stop_reason, usage}` |
+
+**实现方式（零重复调度）**：入口把请求翻译成内部 chat 请求体内的等价形式，然后**原样走内部 `/v1/chat/completions` 全链路**（选号 / 轮换 / 冷却 / 编排降级 / 密钥鉴权 / 计费），再把响应（非流式整体转写、流式逐帧转 SSE）翻回目标协议。调度逻辑只有一份，两条新链路不重复实现任何选号代码。
+
+- 流式：`/v1/messages` 输出 `message_start → content_block_start → ping → content_block_delta* → content_block_stop → message_delta → message_stop`；`/v1/responses` 输出 `response.created → response.output_item.added → response.content_part.added → response.output_text.delta* → response.output_text.done → response.output_item.done → response.completed`。
+- 鉴权与错误：鉴权沿用原 `api_key` 与 `wbk_` 子钥匙；错误按**入口协议**返回（`/v1/messages` 返回 Anthropic 形状 `{"type":"error","error":{...}}`，另两个返回 OpenAI 形状）。
+- 计费：与 chat 完全一致，走同一份用量统计与额度扣减。
+- 模型编排：`model=auto` 在三个端点上都生效，降级链与昼夜切换同样适用；实际命中的模型仍通过响应头 `X-WB2A-Routed-Model` 回传。
+- 不支持的字段（如 Responses 的 `tools` / `previous_response_id`、Messages 的 `thinking`）**静默忽略**，不报错。
+
+**怎么用**
+
+```bash
+# OpenAI Responses API
+curl http://HOST:7863/v1/responses \
+  -H "Authorization: Bearer <你的key>" -H "Content-Type: application/json" \
+  -d '{"model":"auto","input":"用一句话介绍自己"}'
+
+# Anthropic Messages API
+curl http://HOST:7863/v1/messages \
+  -H "Authorization: Bearer <你的key>" \
+  -H "Content-Type: application/json" -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"auto","max_tokens":1024,"messages":[{"role":"user","content":"用一句话介绍自己"}]}'
+```
+
+Claude Code 直接把 `ANTHROPIC_BASE_URL` 指到网关即可（`http://HOST:7863`，key 用 `wbk_` 子钥匙或管理员 key）。
+
+**新增文件**：`internal/server/compat.go`（转写框架 / 录制器 / SSE 发射）、`internal/server/compat_responses.go`、`internal/server/compat_messages.go`；路由注册在 `internal/server/handler.go`。
+
+---
+
 ## 上游已有能力（不在本文档展开）
 
 以下能力全部来自上游，未做删改，用法见对应文档：
@@ -205,7 +246,7 @@ curl -i http://HOST:7863/v1/chat/completions \
 | Web 管理面板（账号池 / 模型档位 / 在线改配置 / 日志） | [上游 README · Web 管理面板](https://github.com/linguo2625469/workbuddy2api-panel#readme) |
 | 完整配置项速查、环境变量覆盖、API 端点、错误分类 | [上游 README · 配置说明](https://github.com/linguo2625469/workbuddy2api-panel#readme) |
 
-增强注入点自检（合并上游后确认两项增强没被冲掉）：`bash tools/check-enhancements.sh`。
+增强注入点自检（合并上游后确认三项增强没被冲掉）：`bash tools/check-enhancements.sh`。
 
 ---
 
@@ -226,12 +267,15 @@ curl -i http://HOST:7863/v1/chat/completions \
 
 - 根项目：[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)
 - 直接上游：[linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)
-- 本仓库二改（2026-09）：**API 密钥分发** 与 **模型编排**，新增代码：
+- 本仓库二改（2026-09）：**API 密钥分发**、**模型编排** 与 **协议兼容层**，新增代码：
 
 | 新增文件 | 作用 |
 |---|---|
 | `internal/apikeys/apikeys.go` | 密钥库：签发 / 校验 / 额度 / 白名单 / 落盘 |
 | `internal/autoroute/autoroute.go` | 编排引擎：昼夜主模型 + 降级链展开 |
 | `internal/panel/keys.go` | 面板密钥管理接口 `/panel/api/keys` |
+| `internal/server/compat.go` | 协议兼容层：转写框架、响应录制器、SSE 事件发射、按协议分发错误 |
+| `internal/server/compat_responses.go` | OpenAI Responses API 双向转写 |
+| `internal/server/compat_messages.go` | Anthropic Messages API 双向转写 |
 
-改动的上游文件：`cmd/server/config.go`、`cmd/server/main.go`、`internal/server/handler.go`、`internal/server/resolve_model.go`、`internal/livecfg/livecfg.go`、`internal/upstream/client.go`、`internal/upstream/hint.go`、`internal/panel/panel.go`、`internal/panel/app.js`、`internal/panel/index.html`。
+改动的上游文件：`cmd/server/config.go`、`cmd/server/main.go`、`internal/server/handler.go`（新增两条路由）、`internal/server/resolve_model.go`、`internal/livecfg/livecfg.go`、`internal/upstream/client.go`、`internal/upstream/hint.go`、`internal/panel/panel.go`、`internal/panel/app.js`、`internal/panel/index.html`。

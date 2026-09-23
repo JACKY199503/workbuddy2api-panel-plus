@@ -128,6 +128,10 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// 协议兼容层（compat_*.go）：Responses API / Anthropic Messages API 形态，
+	// 入站翻译成 chat 请求后复用同一条链路（选号/编排/密钥/记账自动继承）。
+	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
+	h.mux.HandleFunc("POST /v1/messages", h.withAuth(h.messages))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -155,10 +159,10 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			if err != nil {
 				ke, ok := err.(*apikeys.Err)
 				if !ok {
-					writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+					writeAuthError(w, r, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 					return
 				}
-				writeOpenAIError(w, ke.Status, ke.Code, ke.Msg)
+				writeAuthError(w, r, ke.Status, ke.Code, ke.Msg)
 				return
 			}
 			h.cfg.Keys.Touch(k.ID, ip)
@@ -167,7 +171,7 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
-			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+			writeAuthError(w, r, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 			return
 		}
 		next(w, r)
