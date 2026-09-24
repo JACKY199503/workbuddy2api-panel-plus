@@ -86,25 +86,6 @@ docker compose up -d
 | `expires_at` | 过期时间（RFC3339），空 = 不过期 |
 | `enabled` | 停用开关 |
 
-**怎么用**
-
-```bash
-curl http://HOST:7863/v1/chat/completions \
-  -H "Authorization: Bearer wbk_xxxxxxxxxxxxxxxx" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"auto","messages":[{"role":"user","content":"hi"}]}'
-```
-
-**错误口径**（刻意区分，方便客户端判断要不要重试）
-
-| 场景 | 状态码 |
-|---|---|
-| 停用 / 过期 | 403 |
-| 额度用尽（token 或积分） | 429 |
-| IP 不在白名单 / IP 超限 / 版本不匹配 / 模型不在白名单 | 400 |
-
-**安全默认**：`trust_proxy` 默认 `false` —— 只认 TCP 对端地址，**不读可伪造的 `X-Forwarded-For` / `X-Real-IP`**，避免伪造头绕过 IP 白名单。确实挂在反向代理后面、需要真实客户端 IP 时，才在 `config.json` 里设 `"trust_proxy": true`。
-
 ---
 
 <a id="model-orchestration"></a>
@@ -113,7 +94,16 @@ curl http://HOST:7863/v1/chat/completions \
 
 **一句话目的**：把每天能白嫖的额度尽量用满；免费窗口过期、额度波动、被限流时**自动**换模型，全程不用手动改配置。
 
-做法只有一个：客户端写 `model=auto`，剩下的全交给网关。具名模型（`cn:hy3` 之类）不受任何影响，照旧原样透传。
+**怎么触发**：请求里 `model` 传下面这些名字，网关才接管编排（`auto_model.enabled` 为 `true` 时生效）：
+
+| 你传的 model | 结果 |
+|---|---|
+| `auto` | 走编排。白天用 `day_primary`、夜里用 `night_primary`，降级链不挑版本 |
+| `cn:auto` | 走编排，但候选链只留 `cn:` 开头的模型 |
+| `global:auto` | **默认配置下不走编排** —— 主模型和降级链里全是 `cn:` 模型，没有 global 候选，这个名字会原样发给上游（基本是 404）。想让 global 也编排，先往 `fallback` 里加 global 模型 |
+| `cn:hy3`、`cn:deepseek-v4.1-flash` 这类具体名字 | 就是那个模型，不走编排，原样透传 |
+
+三个端点都认这几种写法。`/v1/models` 里能查到的虚拟名是 `auto` 和 `cn:auto` 两个。
 
 - **按钟点自动换主模型**：白天吃白天的免费额度，夜里吃夜里的免费窗口，到点自动切回。
 - **出问题自动沿链降级**：主模型被限流 / 积分耗尽 / 上游报错 / 返回空正文，就沿降级链往下挑下一个能用的。
@@ -130,66 +120,20 @@ curl http://HOST:7863/v1/chat/completions \
 - 白天主模型 `cn:hy3` 本身也在降级链里 —— 夜里 `cn:hy4-preview` 挂掉时接上的就是它；白天它已是链首，链里重复出现的那一项会被**自动去重跳过**。所以一条 `fallback` 同时服务昼夜两个时段。
 - 链尾 `cn:hy3-x` 是兜底位：只要账号还有额度就一定有响应，不会把请求打空。
 
-### 配置（`config.json` 的 `auto_model` 段；面板「配置」页可直接改，保存热生效）
+### 具体模型名也能挂降级链
 
-```json
-"auto_model": {
-  "enabled": true,
-  "day_primary":   "cn:hy3",
-  "night_primary": "cn:hy4-preview",
-  "day_start": 8,
-  "day_end": 23,
-  "fallback": ["cn:hy3", "cn:deepseek-v4.1-flash", "cn:glm-5.3-flash", "cn:hy3-x"],
-  "on_empty": true,
-  "virtual_id": "auto",
-  "override": true
-}
-```
-
-| 字段 | 含义 |
-|---|---|
-| `enabled` | 编排开关。**代码缺省 false**（不写这段 = `auto` 当普通模型名直出，零回归）；本仓库 `config.example.json` 给的是 `true`（开箱即薅额度） |
-| `day_primary` / `night_primary` | 白天 / 夜间主模型（带 realm 前缀） |
-| `day_start` / `day_end` | 白天窗口 `[start, end)`，按 **Asia/Shanghai 小时**判定，默认 8 / 23 |
-| `fallback` | 有序降级链（带 realm 前缀），昼夜共用；与主模型重复项自动跳过 |
-| `virtual_id` / `override` | 虚拟模型名（默认 `auto`）；与上游真实模型同名时是否强行接管（上游 cn 侧下发过同名 `auto`，想接管就开 true 或改名） |
-| `on_empty` | 上游 200 但正文为空也算失败并降级（部分模型 `reasoning_effort=max` 吃满预算会返回空），默认 true |
-| `fallback_on` | 可触发降级的错误类别，空 = 内置默认集合 |
-
-### 什么情况会降级
-
-429 软限流 · 402 额度耗尽 · 上游 `11102` · 5xx · 无健康账号 · 上游 200 空正文（`on_empty`）。
-
-反例（**不降级**）：内容拦截、参数错误、上下文超长、请求体解析失败 —— 这些是请求本身的问题，换任何模型都一样撞墙，直接 fail-fast。
-
-### 具名模型也能挂同一条链
-
-`model_fallback` 的键是客户端写的模型名（逐字匹配），这样即使客户端写死 `cn:hy3`，也能享受和 `auto` 一样的降级：
+传具体模型名（比如 `cn:deepseek-v4.1-flash`）就是它自己，跟 `auto` 没关系，不受编排影响。
+但可以在 `model_fallback` 里给它配一条链 —— 它挂了就往下顶：
 
 ```json
 "model_fallback": {
   "cn:hy3":                 ["cn:deepseek-v4.1-flash", "cn:glm-5.3-flash", "cn:hy3-x"],
-  "cn:hy4-preview":         ["cn:hy3", "cn:deepseek-v4.1-flash", "cn:glm-5.3-flash", "cn:hy3-x"],
-  "cn:deepseek-v4.1-flash": ["cn:glm-5.3-flash", "cn:hy3-x"],
-  "cn:glm-5.3-flash":       ["cn:hy3-x"]
+  "cn:deepseek-v4.1-flash": ["cn:glm-5.3-flash", "cn:hy3-x"]
 }
 ```
 
-两条链可叠加：链上每一项再按本表递归展开（限深 3、链长 ≤ 8、去重）。
-
-### 怎么知道实际用了哪个模型
-
-响应头 `X-WB2A-Routed-Model`：
-
-```bash
-curl -i http://HOST:7863/v1/chat/completions \
-  -H "Authorization: Bearer <你的key>" -H "Content-Type: application/json" \
-  -d '{"model":"auto","messages":[{"role":"user","content":"hi"}],"stream":false}'
-# 白天：X-WB2A-Routed-Model: cn:hy3
-# 夜里：X-WB2A-Routed-Model: cn:hy4-preview
-```
-
-**一处语义修正**：上游业务码 `14018`（`Credits exhausted`，账号积分耗尽）原本被归进 `rate_limit_exceeded` 当限流处理 —— 重试不可能成功。现已单列为 `402 upstream_credits_exhausted`，提示直接写明「需充值 / 等额度重置」。
+键要跟请求里传的模型名一字不差。两条链叠加展开，自动去重，最多 8 个、递归 3 层。
+没写进这张表的模型名，就是原样透传，没有降级。
 
 ---
 
@@ -210,7 +154,7 @@ curl -i http://HOST:7863/v1/chat/completions \
 - 流式：`/v1/messages` 输出 `message_start → content_block_start → ping → content_block_delta* → content_block_stop → message_delta → message_stop`；`/v1/responses` 输出 `response.created → response.output_item.added → response.content_part.added → response.output_text.delta* → response.output_text.done → response.output_item.done → response.completed`。
 - 鉴权与错误：鉴权沿用原 `api_key` 与 `wbk_` 子钥匙；错误按**入口协议**返回（`/v1/messages` 返回 Anthropic 形状 `{"type":"error","error":{...}}`，另两个返回 OpenAI 形状）。
 - 计费：与 chat 完全一致，走同一份用量统计与额度扣减。
-- 模型编排：`model=auto` 在三个端点上都生效，降级链与昼夜切换同样适用；实际命中的模型仍通过响应头 `X-WB2A-Routed-Model` 回传。
+- 模型编排：传 `auto` / `cn:auto` 在三个端点上都生效，降级链与昼夜切换同样适用；实际命中的模型仍通过响应头 `X-WB2A-Routed-Model` 回传。
 - 不支持的字段（如 Responses 的 `tools` / `previous_response_id`、Messages 的 `thinking`）**静默忽略**，不报错。
 
 **怎么用**
@@ -245,19 +189,6 @@ Claude Code 直接把 `ANTHROPIC_BASE_URL` 指到网关即可（`http://HOST:786
 | 成长任务一键完成、连登管家、开学季活动 | [上游 README · 成长任务](https://github.com/linguo2625469/workbuddy2api-panel#readme) |
 | Web 管理面板（账号池 / 模型档位 / 在线改配置 / 日志） | [上游 README · Web 管理面板](https://github.com/linguo2625469/workbuddy2api-panel#readme) |
 | 完整配置项速查、环境变量覆盖、API 端点、错误分类 | [上游 README · 配置说明](https://github.com/linguo2625469/workbuddy2api-panel#readme) |
-
-合并上游新版本后，用 `git diff` 对照 `internal/apikeys/`、`internal/autoroute/`、`internal/server/compat*.go` 与 `internal/panel/keys.go` 四项，即可确认三项增强没被冲掉。
-
----
-
-## 安全与合规
-
-- **凭据**：`auths/` 存明文 token（0600），**切勿提交 git**（`.gitignore` 已排除 `auths/`、`data/`、`config.json`）
-- **公网部署**：服务只提供明文 HTTP，**必须置于 HTTPS 反向代理之后**并设置 `api_key`
-- **IP 白名单**：`trust_proxy` 默认 `false`，不读可伪造的 `X-Forwarded-For`
-- **合规**：非官方网关，仅限**本人授权账号**、本机 / 私有环境测试；遵守 CodeBuddy 服务条款，作者不对账号封禁或条款违约负责
-
----
 
 ## License
 
