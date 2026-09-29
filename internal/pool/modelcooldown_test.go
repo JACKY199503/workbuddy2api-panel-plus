@@ -182,17 +182,24 @@ func TestModelCooldownsPreservedByNoteSuccess(t *testing.T) {
 	}
 }
 
-// TestModelCooldownsClearedByRevive 签到解冻（reviveCoolingLocked）→ 模型级 6004 冷却清零。
-func TestModelCooldownsClearedByRevive(t *testing.T) {
+// TestModelCooldownsSurviveRevive 签到/余额刷新解冻（reviveCoolingLocked）不得清
+// 模型级 6004 冷却——限流的恢复证据是上游重置墙钟到期，不是余额恢复；余额刷新
+// 周期任务每 5 分钟经 ReenableIfCredits 到达这里，若在此清台账，撞限号会被误判
+// 健康、重新选中再撞 429，全池冷却保护形同虚设（两号池实测复现：expiring==0 的
+// 号每 5 分钟被抹一次台账，expiring>0 的号走 SetCreditsDetailed 幸免，行为不对称）。
+func TestModelCooldownsSurviveRevive(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.CooldownSoftForModel("u1", 600*time.Second, time.Now().Add(time.Hour), "glm-5.3", "6004")
 	p.ReenableIfCredits("u1", 500, 0)
 	p.mu.RLock()
-	n := len(p.byUID["u1"].modelCooldowns)
+	mc, ok := p.byUID["u1"].modelCooldowns["glm-5.3"]
 	p.mu.RUnlock()
-	if n != 0 {
-		t.Errorf("revive 后 modelCooldowns=%d want 0", n)
+	if !ok {
+		t.Fatal("revive 后 modelCooldowns[glm-5.3] 应保留——余额恢复不构成限流解除证据")
+	}
+	if rem := time.Until(mc.Until); rem < 55*time.Minute || rem > time.Hour+time.Minute {
+		t.Errorf("6004 until 应保持 ~1h 不变, got remaining=%v", rem)
 	}
 }
 

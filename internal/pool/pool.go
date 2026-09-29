@@ -42,9 +42,12 @@ type Pool struct {
 	degradeThreshold   int
 	degradeCooldown    time.Duration
 	degradeCooldownMax time.Duration
-	// 三因子加权调优（SetWeights 注入；默认值见 defaultIdle*）。
+	// 加权路由的闲置补偿调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
+	// preferExpiring 最早到期优先路由开关（默认 true）。开启且快过期窗口内存在有效
+	// 批次时，选号在成本层内先按最早到期排序；关闭后只使用普通加权路由。
+	preferExpiring bool
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
@@ -77,6 +80,7 @@ func New(stateFp string) *Pool {
 		breakerCooldownMax: defaultBreakerCooldownMax,
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
+		preferExpiring:     true,
 		degradeThreshold:   defaultDegradeThreshold,
 		degradeCooldown:    defaultDegradeCooldown,
 		degradeCooldownMax: defaultDegradeCooldownMax,
@@ -158,7 +162,7 @@ func (p *Pool) CostExploreStatus() (events int64, last map[string]time.Time) {
 	return p.costExploreEvents, last
 }
 
-// SetWeights 注入三因子加权的闲置补偿参数。非正值保留原值（用默认）。
+// SetWeights 注入加权路由的闲置补偿参数。非正值保留原值（用默认）。
 func (p *Pool) SetWeights(idlePerHour, idleMax float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -168,6 +172,13 @@ func (p *Pool) SetWeights(idlePerHour, idleMax float64) {
 	if idleMax > 0 {
 		p.idleWeightMax = idleMax
 	}
+}
+
+// SetPreferExpiring 注入最早到期优先路由开关（main 从 config 解析后调用）。
+func (p *Pool) SetPreferExpiring(enabled bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.preferExpiring = enabled
 }
 
 // SetDegrade 注入连败降权参数（main 从 config 解析后调用，issue #114）。

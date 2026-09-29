@@ -753,29 +753,34 @@ func TestCooldownSoftStreakResetBySuccess(t *testing.T) {
 	wantCoolSec(t, p, "u1", 600, 3)
 }
 
-func TestCooldownSoftStreakResetByReenable(t *testing.T) {
-	// 签到解冻（reviveCoolingLocked）清 cooling 域 → softStreak 一并归零；
-	// 熔断域（fails/retryCount/breakerUntil）不动，与既有 C5 语义一致。
+func TestCooldownSoftKeptByReenable(t *testing.T) {
+	// 签到/余额刷新解冻（reviveCoolingLocked）只解冻余额耗尽冷却（CoolHard）；
+	// 软限流冷却（CoolSoft）与 softStreak 保留——限流恢复证据是重置墙钟/退避到期，
+	// 不是余额恢复（余额刷新每 5 分钟一次，若在此清冷却域，限流保护实际寿命被压到
+	// 一个刷新周期内）。熔断域（fails/retryCount/breakerUntil）不动，与既有 C5 语义一致。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
+	expireCooldown(p, "u1") // 跨冷却期第二次限流，streak 累计到 2（冷却中重复触发不堆叠，#152）
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
 	failsBefore := p.breakerFails("u1")
 
 	p.ReenableIfCredits("u1", 500, 0)
 	st, _ := p.Status("u1")
-	if st.SoftStreak != 0 {
-		t.Errorf("reenable should reset soft_streak, got %d", st.SoftStreak)
+	if !st.Cooling {
+		t.Errorf("reenable 不得解除软限流冷却: %+v", st)
 	}
-	if st.Cooling {
-		t.Errorf("reenable should clear cooling: %+v", st)
+	if st.SoftStreak != 2 {
+		t.Errorf("reenable 不得清零软限流退避计数 soft_streak, got %d want 2", st.SoftStreak)
 	}
 	if failsAfter := p.breakerFails("u1"); failsAfter != failsBefore {
 		t.Errorf("reenable must not touch breaker: fails %d → %d", failsBefore, failsAfter)
 	}
 
+	// 退避延续：第 3 次触发从既有 streak=2 继续 → 600s<<2 = 2400s（而非归零后的 600s）。
+	expireCooldown(p, "u1")
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
-	wantCoolSec(t, p, "u1", 600, 3)
+	wantCoolSec(t, p, "u1", 2400, 3)
 }
 
 func TestCooldownHardDoesNotAdvanceSoftStreak(t *testing.T) {
@@ -1731,5 +1736,90 @@ func TestTokenUsagePersistsAcrossReload(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "AccessToken") || strings.Contains(string(raw), "RefreshToken") {
 		t.Fatalf("state.json contains credential field: %s", raw)
+	}
+}
+
+func TestPickPrefersEarliestExpiring(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "later"})
+	p.Add(&auth.Auth{UID: "soon"})
+	p.Add(&auth.Auth{UID: "none"})
+
+	now := time.Now()
+	p.SetCreditsDetailed("later", 100, 100, 100, now.Add(48*time.Hour), 100)
+	p.SetCreditsDetailed("soon", 10, 10, 10, now.Add(2*time.Hour), 10)
+	p.SetCreditsDetailed("none", 1000, 1000, 0, time.Time{}, 0)
+
+	for i := 0; i < 5; i++ {
+		got := p.Pick()
+		if got == nil || got.UID != "soon" {
+			t.Fatalf("pick %d=%v want soon", i, got)
+		}
+	}
+}
+
+func TestPickEarliestExpiryTieBreaksByRemaining(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "small"})
+	p.Add(&auth.Auth{UID: "large"})
+
+	at := time.Now().Add(time.Hour)
+	p.SetCreditsDetailed("small", 10, 10, 10, at, 10)
+	p.SetCreditsDetailed("large", 50, 50, 50, at, 50)
+
+	got := p.Pick()
+	if got == nil || got.UID != "large" {
+		t.Fatalf("pick=%v want large", got)
+	}
+}
+
+func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "a"})
+	p.Add(&auth.Auth{UID: "b"})
+	now := time.Now()
+	p.SetCreditsDetailed("a", 100, 100, 50, now.Add(time.Hour), 50)
+	p.SetCreditsDetailed("b", 100, 100, 0, time.Time{}, 0)
+	p.SetPreferExpiring(false)
+
+	p.mu.Lock()
+	wa := p.weightOf(p.byUID["a"], 100, now)
+	wb := p.weightOf(p.byUID["b"], 100, now)
+	p.mu.Unlock()
+	if wa != wb {
+		t.Fatalf("disabled expiring weights differ: %v/%v", wa, wb)
+	}
+}
+
+func TestCreditExpirySnapshotConsumptionAndClear(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	now := time.Now()
+	p.SetCreditsDetailed("u1", 100, 100, 50, now.Add(time.Hour), 40)
+
+	st, _ := p.Status("u1")
+	if st.CreditsExpiring != 50 || st.CreditsEarliestRemaining != 40 || st.CreditsEarliestExpiry.IsZero() {
+		t.Fatalf("initial snapshot=%+v", st)
+	}
+
+	p.NoteModelCost("u1", "m", 10, 1000)
+	st, _ = p.Status("u1")
+	if st.Credits != 90 || st.CreditsExpiring != 40 || st.CreditsEarliestRemaining != 30 {
+		t.Fatalf("after consume=%+v", st)
+	}
+
+	p.NoteModelCost("u1", "m", 40, 1000)
+	st, _ = p.Status("u1")
+	if st.Credits != 50 || st.CreditsExpiring != 0 || st.CreditsEarliestRemaining != 0 || !st.CreditsEarliestExpiry.IsZero() {
+		t.Fatalf("after exhaustion=%+v", st)
+	}
+
+	p.SetCreditsDetailed("u1", 50, 50, 10, now.Add(time.Hour), 10)
+	p.SetCreditsDetailed("u1", 50, 50, 0, time.Time{}, 0)
+	st, _ = p.Status("u1")
+	if st.CreditsExpiring != 0 || st.CreditsEarliestRemaining != 0 || !st.CreditsEarliestExpiry.IsZero() {
+		t.Fatalf("zero refresh did not clear snapshot=%+v", st)
 	}
 }

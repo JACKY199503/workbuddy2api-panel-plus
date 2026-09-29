@@ -128,11 +128,12 @@ func TestTransitionSessionDeadDisableClearsCooling(t *testing.T) {
 	}
 }
 
-// TestTransitionReviveClearsCoolingKeepsBreaker reviveCoolingLocked（签到解冻）语义：
-// 清冷却域（until/coolKind/reason/softStreak/modelCooldowns）+ 更新 credits，不动熔断。
+// TestTransitionReviveKeepsSoftCoolingKeepsBreaker reviveCoolingLocked（签到/余额
+// 刷新解冻）语义：只解冻余额耗尽冷却（CoolHard），软限流冷却与 6004 模型级台账
+// **保留**（限流恢复证据是重置墙钟到期，不是余额恢复）+ 更新 credits，不动熔断。
 // 既有单维度测试已各自锁定 reason/softStreak/modelCooldowns，本用例一次性断言完整
 // 字段集，锁定迁移原语对冷却域/熔断域的处置永远一致。
-func TestTransitionReviveClearsCoolingKeepsBreaker(t *testing.T) {
+func TestTransitionReviveKeepsSoftCoolingKeepsBreaker(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	// 冷却域：软冷却 + 6004 模型级冷却（softStreak 累计）。
@@ -149,15 +150,31 @@ func TestTransitionReviveClearsCoolingKeepsBreaker(t *testing.T) {
 		t.Errorf("revive 后 credits=%d want 700", st.Credits)
 	}
 	until, kind, reason, streak, mc := coolingDomain(t, p, "u1")
-	if !until.IsZero() || kind != 0 || reason != "" || streak != 0 || mc != 0 {
-		t.Errorf("revive 应清冷却域：until=%v kind=%v reason=%q streak=%d modelCooldowns=%d",
-			until, kind, reason, streak, mc)
+	if until.IsZero() || kind == 0 || reason == "" {
+		t.Errorf("revive 不得解除软限流冷却：until=%v kind=%v reason=%q", until, kind, reason)
 	}
+	if mc == 0 {
+		t.Error("revive 不得清 6004 模型级台账（余额恢复不构成限流解除证据）")
+	}
+	_ = streak // 本场景 streak 恒 0（Cooldown 固定时长入口不累计、带 resetAt 的模型级写入也不累计）
 	if bt, ok := p.breakerUntil("u1"); !ok || bt.IsZero() {
 		t.Fatal("revive 不得清熔断（chat 通道健康未证明）")
 	}
 	// 熔断域保留 → 账号不进 normal 候选（仅全冷却兜底仍可能选中，与熔断兜底语义一致）。
 	if p.internalHealthy("u1") {
 		t.Fatal("revive 后熔断期内不应 healthy（熔断域未被签到覆盖）")
+	}
+}
+
+// TestTransitionReviveUnfreezesHardCooling 余额耗尽冷却（CoolHard）才是
+// ReenableIfCredits 的解冻对象：余额恢复（remain>0）正是它的权威恢复证据。
+func TestTransitionReviveUnfreezesHardCooling(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownUntilTomorrow4AM("u1", "余额不足")
+	p.ReenableIfCredits("u1", 700, 0)
+	until, kind, reason, _, _ := coolingDomain(t, p, "u1")
+	if !until.IsZero() || kind != 0 || reason != "" {
+		t.Errorf("余额恢复应解冻 CoolHard：until=%v kind=%v reason=%q", until, kind, reason)
 	}
 }

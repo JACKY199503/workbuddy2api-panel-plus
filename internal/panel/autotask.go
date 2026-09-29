@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -316,6 +317,14 @@ func acceptStatusOr(t *upstream.Task) string {
 // mpActionGap mp 任务写动作间隔（accept/上报/领奖之间，防频控）。
 var mpActionGap = 2 * time.Second
 
+// mpChatEventGap mp 对话事件（chat_request_send）的真人节奏间隔。上游对
+// Sequential_Tasks_3「5 次有效对话」有反作弊校验：数秒级连发的事件会先被计入
+// 进度（回读 5/5、accept_status 甚至短暂转 completed），随后被判定无效整体回滚
+// （进度回落、claim 返回 400 "task not completed"）——2026-09-26 实测 2s 连发
+// 4 条全灭，45s 间隔逐条上报全存活且 claim +300c+5e 成功。每条上报前
+// sleep gap + 0~10s 抖动；首条也等（上一轮残留进度被回滚后立即重报同样无效）。
+var mpChatEventGap = 45 * time.Second
+
 // runMPMiniChatTask growth 域小程序限定任务通用闭环：
 // mp 查询 → accept（带登记回读验证）→ mini chat 事件上报（withActivityId 决定
 // 是否带开学季 activityId：school_season 必带，Sequential_Tasks_1 不带——服务端按
@@ -348,9 +357,11 @@ func (p *Panel) runMPMiniChatTask(a *auth.Auth, code string, withActivityId bool
 		}
 		return fmt.Sprintf("已领取奖励（+%dc +%de）", credit, energy), nil
 	}
-	// 判据上报：按差额补 mini chat 事件。
+	// 判据上报：按差额补 mini chat 事件。每条前 sleep mpChatEventGap+抖动——
+	// 连发会被上游反作弊判无效（见 mpChatEventGap 注释），宁可慢不可白报。
 	need := target - t.Current
 	for i := int64(0); i < need; i++ {
+		time.Sleep(mpChatEventGap + time.Duration(rand.Int64N(int64(10*time.Second))))
 		conv := fmt.Sprintf("wb2api-mp-%d-%d", time.Now().UnixMilli(), i)
 		var ev map[string]any
 		if withActivityId {
@@ -361,7 +372,6 @@ func (p *Panel) runMPMiniChatTask(a *auth.Auth, code string, withActivityId bool
 		if err := p.cfg.Upstream.ReportMPEvent(a, ev); err != nil {
 			return fmt.Sprintf("完成 %d/%d 次上报后中断: %v", i, need, err), nil
 		}
-		time.Sleep(mpActionGap)
 	}
 	// 回读（异步计分，有界轮询复用 claimPoll 预算的紧凑版：两轮各隔 3s）。
 	for i := 0; i < 2; i++ {
@@ -404,9 +414,10 @@ func runSequentialChat(p *Panel, a *auth.Auth) (string, error) {
 
 // runSequentialChat5 完成 Sequential_Tasks_3「在小程序内完成 5 次有效对话」。
 // 判据与 Sequential_Tasks_1 同形状（mini 指纹 chat_request_send，无 activityId），
-// 仅 target=5——服务端按上报条数累加进度。runMPMiniChatTask 本就按 target 差额
-// 补报（含未 accept 时 progress 为 null 的 target 兜底），无需新事件形状
-// （上游 task_runner 实测两账号 +300c+5e，重跑幂等）。
+// 仅 target=5——服务端按上报条数累加进度，但**要求真人节奏**：连发事件先计数
+// 后被反作弊回滚（claim 400 "task not completed"），由 mpChatEventGap 间隔保证
+// （2026-09-26 实测：45s 间隔补满 5/5 → claim +300c+5e 成功，领后 accept_status
+// =claimed 稳定不回滚）。
 func runSequentialChat5(p *Panel, a *auth.Auth) (string, error) {
 	return p.runMPMiniChatTask(a, "Sequential_Tasks_3", false)
 }
@@ -414,6 +425,7 @@ func runSequentialChat5(p *Panel, a *auth.Auth) (string, error) {
 // runSequentialChat10 完成 Sequential_Tasks_6「在小程序内完成 10 次有效对话」（预留）。
 // 判据假定与 Tasks_1/3 同形状（mini chat_request_send），target 由任务自带（回读），
 // runMPMiniChatTask 按差额补报——issue #42 称 target=10，以解锁后实际下发为准。
+// 真人节奏间隔同样适用（mpChatEventGap）：9 条 × ~50s ≈ 8 分钟/账号，夜间队列可接受。
 func runSequentialChat10(p *Panel, a *auth.Auth) (string, error) {
 	return p.runMPMiniChatTask(a, "Sequential_Tasks_6", false)
 }

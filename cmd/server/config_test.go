@@ -22,6 +22,32 @@ func TestDefault(t *testing.T) {
 	}
 }
 
+func TestPanelPackageDetailLimit(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Panel.PackageDetailLimit != 5 {
+		t.Fatalf("default package_detail_limit=%d want 5", c.Panel.PackageDetailLimit)
+	}
+
+	configured, err := ParseConfig([]byte(`{"panel":{"package_detail_limit":8}}`))
+	if err != nil {
+		t.Fatalf("parse configured limit: %v", err)
+	}
+	if configured.Panel.PackageDetailLimit != 8 {
+		t.Fatalf("configured package_detail_limit=%d want 8", configured.Panel.PackageDetailLimit)
+	}
+
+	fallback, err := ParseConfig([]byte(`{"panel":{"package_detail_limit":0}}`))
+	if err != nil {
+		t.Fatalf("parse fallback limit: %v", err)
+	}
+	if fallback.Panel.PackageDetailLimit != 5 {
+		t.Fatalf("fallback package_detail_limit=%d want 5", fallback.Panel.PackageDetailLimit)
+	}
+}
+
 func TestLoadFile(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")
@@ -90,6 +116,9 @@ func TestNewPoolConfigDefaults(t *testing.T) {
 	if c.Pool.IdleWeightPerHour != 0.5 || c.Pool.IdleWeightMax != 5.0 {
 		t.Errorf("idle weights=%v/%v", c.Pool.IdleWeightPerHour, c.Pool.IdleWeightMax)
 	}
+	if !c.Pool.PreferExpiring || c.ExpiringSoonDur != 7*24*time.Hour {
+		t.Errorf("expiring defaults: enabled=%v window=%v", c.Pool.PreferExpiring, c.ExpiringSoonDur)
+	}
 	if c.SoftRateMaxDur.Hours() != 2 {
 		t.Errorf("soft_rate_max=%v want 2h", c.SoftRateMaxDur)
 	}
@@ -115,7 +144,9 @@ func TestPoolConfigParsedFromFile(t *testing.T) {
 			"breaker_cooldown":"10m",
 			"breaker_cooldown_max":"2h",
 			"idle_weight_per_hour":0.7,
-			"idle_weight_max":8.0
+			"idle_weight_max":8.0,
+			"prefer_expiring":false,
+			"expiring_soon":"72h"
 		},
 		"session_sticky":{"enabled":false,"ttl":"1h","gc_interval":"2m"}
 	}`), 0o600)
@@ -134,6 +165,9 @@ func TestPoolConfigParsedFromFile(t *testing.T) {
 	}
 	if c.Pool.IdleWeightPerHour != 0.7 || c.Pool.IdleWeightMax != 8.0 {
 		t.Errorf("idle weights=%v/%v", c.Pool.IdleWeightPerHour, c.Pool.IdleWeightMax)
+	}
+	if c.Pool.PreferExpiring || c.ExpiringSoonDur != 72*time.Hour {
+		t.Errorf("expiring override: enabled=%v window=%v", c.Pool.PreferExpiring, c.ExpiringSoonDur)
 	}
 	if c.SessionSticky.Enabled {
 		t.Error("session_sticky.enabled want false from file")
@@ -156,6 +190,32 @@ func TestSoftRateMaxParsedFromFile(t *testing.T) {
 	}
 	if c.SoftRateMaxDur.Minutes() != 45 {
 		t.Errorf("soft_rate_max=%v want 45m", c.SoftRateMaxDur)
+	}
+}
+
+func TestLegacyConfigKeepsPreferExpiringEnabled(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"pool":{"idle_weight_max":3}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Pool.PreferExpiring {
+		t.Fatal("missing prefer_expiring must preserve default true")
+	}
+}
+
+func TestNegativeExpiringSoonClampsToDisabled(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"pool":{"expiring_soon":"-1h"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ExpiringSoonDur != 0 || c.Pool.ExpiringSoon != "0" {
+		t.Fatalf("negative window=%v/%q want 0/0", c.ExpiringSoonDur, c.Pool.ExpiringSoon)
 	}
 }
 

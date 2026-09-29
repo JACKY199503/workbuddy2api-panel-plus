@@ -2,9 +2,14 @@ package upstream
 
 import (
 	"encoding/json"
+	"errors"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
 
 func TestPrepareBodyForcesStream(t *testing.T) {
@@ -771,5 +776,119 @@ func TestStreamNormalPassthroughRegression(t *testing.T) {
 				t.Errorf("frame not normalized: %q", body)
 			}
 		})
+	}
+}
+
+// TestNormalizeUsageCacheAliasesMirrorsNestedHit / PreservesZeroResult 自
+// usage_test.go 迁入（PR #57 原新文件按仓库规则不收，核心断言保留在此——
+// normalize 钩子就挂在 sse.go 的 Aggregate/normalizeFrame 两个出口）。
+func TestNormalizeUsageCacheAliasesMirrorsNestedHit(t *testing.T) {
+	usage := map[string]any{
+		"prompt_tokens":            21041.0,
+		"completion_tokens":        8.0,
+		"total_tokens":             21049.0,
+		"cache_read_input_tokens":  0.0,
+		"cached_tokens":            0.0,
+		"prompt_cache_hit_tokens":  0.0,
+		"prompt_cache_miss_tokens": 177.0,
+		"prompt_tokens_details": map[string]any{
+			"cached_tokens": 20864.0,
+		},
+	}
+
+	got := normalizeUsageCacheAliases(usage)
+
+	for _, key := range []string{
+		"cache_read_input_tokens",
+		"cached_tokens",
+		"prompt_cache_hit_tokens",
+	} {
+		if got[key] != 20864.0 {
+			t.Fatalf("%s=%v want 20864", key, got[key])
+		}
+	}
+	details := got["prompt_tokens_details"].(map[string]any)
+	if details["cached_tokens"] != 20864.0 {
+		t.Fatalf("prompt_tokens_details.cached_tokens=%v want 20864", details["cached_tokens"])
+	}
+}
+
+func TestNormalizeUsageCacheAliasesPreservesZeroResult(t *testing.T) {
+	usage := map[string]any{
+		"prompt_tokens":           35.0,
+		"completion_tokens":       2.0,
+		"total_tokens":            37.0,
+		"cache_read_input_tokens": 0.0,
+		"prompt_cache_hit_tokens": 0.0,
+		"prompt_tokens_details": map[string]any{
+			"cached_tokens": 0.0,
+		},
+	}
+
+	got := normalizeUsageCacheAliases(usage)
+
+	details := got["prompt_tokens_details"].(map[string]any)
+	if details["cached_tokens"] != 0.0 {
+		t.Fatalf("prompt_tokens_details.cached_tokens=%v want 0", details["cached_tokens"])
+	}
+}
+
+func TestUserResourceDetailedWithExpirySnapshot(t *testing.T) {
+	now := time.Now().In(softRateResetLoc)
+	soon := now.Add(24 * time.Hour).Truncate(time.Second)
+	later := now.Add(10 * 24 * time.Hour).Truncate(time.Second)
+	payload := `{"code":0,"data":{"Response":{"Data":{"Accounts":[` +
+		`{"PackageName":"soon-a","CycleCapacitySize":10,"CycleCapacityRemain":10,"CycleCapacityUsed":0,"CycleEndTime":"` + soon.Format(packageEndLayout) + `"},` +
+		`{"PackageName":"soon-b","CycleCapacitySize":15,"CycleCapacityRemain":15,"CycleCapacityUsed":0,"CycleEndTime":"` + soon.Format(packageEndLayout) + `"},` +
+		`{"PackageName":"later","CycleCapacitySize":20,"CycleCapacityRemain":20,"CycleCapacityUsed":0,"CycleEndTime":"` + later.Format(packageEndLayout) + `"},` +
+		`{"PackageName":"unknown","CycleCapacitySize":5,"CycleCapacityRemain":5,"CycleCapacityUsed":0}` +
+		`]}}}}`
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource") {
+			return nil, errors.New("wrong path: " + r.URL.Path)
+		}
+		return jsonResp(200, payload), nil
+	})
+
+	remain, total, expiring, earliestAt, earliestRemaining, err := c.UserResourceDetailedWithExpiry(
+		&auth.Auth{AccessToken: "at", UID: "u1"}, 48*time.Hour,
+	)
+	if err != nil {
+		t.Fatalf("resource: %v", err)
+	}
+	if remain != 50 || total != 50 || expiring != 25 {
+		t.Fatalf("remain/total/expiring=%d/%d/%d want 50/50/25", remain, total, expiring)
+	}
+	if earliestRemaining != 25 || !earliestAt.Equal(soon) {
+		t.Fatalf("earliest=%v/%d want %v/25", earliestAt, earliestRemaining, soon)
+	}
+}
+func TestCreditPackagesExpiryTimestamp(t *testing.T) {
+	end := time.Now().In(softRateResetLoc).Add(7 * 24 * time.Hour).Truncate(time.Second)
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource") {
+			return nil, errors.New("wrong path: " + r.URL.Path)
+		}
+		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[`+
+			`{"PackageName":"gift","CycleCapacitySize":100,"CycleCapacityRemain":80,"CycleCapacityUsed":20,"CycleEndTime":"`+
+			end.Format(packageEndLayout)+`"},`+
+			`{"PackageName":"unknown","CycleCapacitySize":10,"CycleCapacityRemain":10,"CycleCapacityUsed":0}`+
+			`]}}}}`), nil
+	})
+	packs, remain, size, err := c.CreditPackages(&auth.Auth{AccessToken: "at", UID: "u1"})
+	if err != nil {
+		t.Fatalf("packages: %v", err)
+	}
+	if remain != 90 || size != 110 {
+		t.Fatalf("remain/size=%d/%d want 90/110", remain, size)
+	}
+	var found bool
+	for _, p := range packs {
+		if p.Name == "gift" {
+			found = p.ExpiresAt == end.UnixMilli()
+		}
+	}
+	if !found {
+		t.Fatalf("gift pack missing Unix-ms expiry: %+v", packs)
 	}
 }

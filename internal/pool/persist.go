@@ -141,22 +141,38 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			errTotal = int64(s.ErrCount)
 		}
 		e := &entry{
-			a:                &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
-			credits:          s.Credits,
-			creditsTotal:     s.CreditsTotal,
-			creditsExpiring:  s.CreditsExpiring,
-			disabled:         s.Disabled,
-			reason:           s.Reason,
-			until:            s.Until,
-			coolKind:         s.CoolKind,
-			successCount:     s.SuccessCount,
-			errTotal:         errTotal,
-			lastErr:          s.LastErr,
-			lastSuccess:      s.LastSuccess,
-			tokenUsage:       s.TokenUsage,
-			softStreak:       s.SoftStreak,
-			sessionDeadFails: s.SessionDeadFails,
-			consecutiveFails: s.ConsecutiveFails,
+			a:                        &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			credits:                  s.Credits,
+			creditsTotal:             s.CreditsTotal,
+			creditsExpiring:          s.CreditsExpiring,
+			creditsEarliestExpiry:    s.CreditsEarliestExpiry,
+			creditsEarliestRemaining: s.CreditsEarliestRemaining,
+			disabled:                 s.Disabled,
+			reason:                   s.Reason,
+			until:                    s.Until,
+			coolKind:                 s.CoolKind,
+			successCount:             s.SuccessCount,
+			errTotal:                 errTotal,
+			lastErr:                  s.LastErr,
+			lastSuccess:              s.LastSuccess,
+			tokenUsage:               s.TokenUsage,
+			softStreak:               s.SoftStreak,
+			sessionDeadFails:         s.SessionDeadFails,
+			consecutiveFails:         s.ConsecutiveFails,
+		}
+		// 到期快照按当前时刻惰性清洗：已过期、零剩余或超出总余额的脏数据不恢复。
+		if e.creditsExpiring < 0 {
+			e.creditsExpiring = 0
+		}
+		if e.creditsExpiring > e.credits {
+			e.creditsExpiring = e.credits
+		}
+		if e.creditsEarliestRemaining < 0 || e.creditsEarliestRemaining > e.credits {
+			e.creditsEarliestRemaining = 0
+		}
+		if e.creditsEarliestRemaining == 0 || e.creditsEarliestExpiry.IsZero() || !now.Before(e.creditsEarliestExpiry) {
+			e.creditsEarliestExpiry = time.Time{}
+			e.creditsEarliestRemaining = 0
 		}
 		// 熔断器持久化恢复：breakerUntil 未过期才恢复（过期不复活），retryCount 仅在
 		// 熔断仍有效时保留（否则归零，不保留无用退避指数）。
@@ -266,21 +282,23 @@ func (p *Pool) stateOverviewLocked() stateFile {
 	sf := stateFile{Accounts: map[string]stateAccount{}}
 	for uid, e := range p.byUID {
 		s := stateAccount{
-			Credits:          e.credits,
-			CreditsTotal:     e.creditsTotal,
-			Disabled:         e.disabled,
-			Reason:           e.reason,
-			Until:            e.until,
-			CoolKind:         e.coolKind,
-			SuccessCount:     e.successCount,
-			ErrTotal:         e.errTotal,
-			LastSuccess:      e.lastSuccess,
-			LastErr:          e.lastErr,
-			TokenUsage:       e.tokenUsage,
-			SoftStreak:       e.softStreak,
-			SessionDeadFails: e.sessionDeadFails,
-			ConsecutiveFails: e.consecutiveFails,
-			CreditsExpiring:  e.creditsExpiring,
+			Credits:                  e.credits,
+			CreditsTotal:             e.creditsTotal,
+			Disabled:                 e.disabled,
+			Reason:                   e.reason,
+			Until:                    e.until,
+			CoolKind:                 e.coolKind,
+			SuccessCount:             e.successCount,
+			ErrTotal:                 e.errTotal,
+			LastSuccess:              e.lastSuccess,
+			LastErr:                  e.lastErr,
+			TokenUsage:               e.tokenUsage,
+			SoftStreak:               e.softStreak,
+			SessionDeadFails:         e.sessionDeadFails,
+			ConsecutiveFails:         e.consecutiveFails,
+			CreditsExpiring:          e.creditsExpiring,
+			CreditsEarliestExpiry:    e.creditsEarliestExpiry,
+			CreditsEarliestRemaining: e.creditsEarliestRemaining,
 		}
 		// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitempty 真省略）。
 		if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {

@@ -3,17 +3,22 @@
   "api_key": "test_key",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
+  "panel": {
+    "package_detail_limit": 5
+  },
   "cooldown": {
     "soft_rate": "600s",
     "soft_rate_max": "2h"
   },
   "schedule": {
     "checkin_hours": [9, 21],
+    "growth_hours": [1],
     "travel_hours": [9, 21],
     "activity_hours": [10],
     "keepalive_hours": [22],
     "blackcat_hours": [23],
     "checkin_enabled": true,
+    "growth_enabled": true,
     "travel_enabled": true,
     "activity_enabled": true,
     "keepalive_enabled": true,
@@ -60,6 +65,7 @@
     "degrade_cooldown_max": "2h",
     "idle_weight_per_hour": 0.5,
     "idle_weight_max": 5.0,
+    "prefer_expiring": true,
     "expiring_soon": "168h",
     "cost_explore_interval": "30m"
   },

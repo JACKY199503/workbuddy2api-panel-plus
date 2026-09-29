@@ -1,13 +1,12 @@
 // taskcenter.go 面板「任务中心」：全账号任务扫描 + 执行队列（可配并发）+
-// 开学季独立状态。解决"不知道哪些账号有哪些任务没做"与"开学季状态不可见"。
+// 成长任务队列。
 //
 // 语义：
-//   - 扫描（scan_all）：并发拉取每账号的成长任务列表 + 开学季任务列表，
+//   - 扫描（scan_all）：并发拉取每账号的成长任务列表（默认+小程序口径），
 //     汇总出"未完成且可自动化"的待办清单（只读，不执行）。
 //   - 执行队列（run_queue + queue）：把待办项按账号分组排队执行——账号内
 //     串行（复用 per-account 锁，与单任务/一键完成互斥），账号间并发
 //     （concurrency 信号量限制，默认 1）。队列状态可轮询。
-//   - 开学季（school/status + school/run_all）：独立状态视图 + 一键闭环。
 package panel
 
 import (
@@ -27,23 +26,12 @@ import (
 // 扫描（只读）
 // ---------------------------------------------------------------------------
 
-// schoolTaskView 开学季任务条目（面板展示口径）。
-type schoolTaskView struct {
-	Code   string `json:"task_code"`
-	Status string `json:"status"` // pending | in_progress | completed | claimed
-	Prog   int    `json:"progress"`
-	Target int    `json:"target_count"`
-}
-
 // scanAccountItem 单账号扫描结果。
 type scanAccountItem struct {
-	UID       string           `json:"uid"`
-	Nickname  string           `json:"nickname"`
-	Growth    []upstream.Task  `json:"growth,omitempty"`
-	GrowthErr string           `json:"growth_error,omitempty"`
-	School    []schoolTaskView `json:"school,omitempty"`
-	SchoolErr string           `json:"school_error,omitempty"`
-	InPeriod  bool             `json:"in_period"`
+	UID       string          `json:"uid"`
+	Nickname  string          `json:"nickname"`
+	Growth    []upstream.Task `json:"growth,omitempty"`
+	GrowthErr string          `json:"growth_error,omitempty"`
 }
 
 // growthPending 任务是否"未完成且可自动化"。
@@ -64,19 +52,7 @@ func growthPending(t upstream.Task) bool {
 	return autoActionFor(t.TaskCode) != nil
 }
 
-// schoolPending 开学季任务是否待办（排除学生认证）。
-func schoolPending(t upstream.SchoolTask) bool {
-	switch t.TaskCode {
-	case "task_student_verify":
-		return false // 需微信学生真实认证
-	case "desktop_chat_1_time":
-		return t.Status != "claimed"
-	default:
-		return t.Status != "claimed" && t.Status != "completed"
-	}
-}
-
-// tasksScanAll 扫描全部账号：成长任务（未完成+可自动化）+ 开学季（未完成）。
+// tasksScanAll 扫描全部账号：成长任务（未完成+可自动化，含 mp 口径合并）。
 // 只读操作，并发拉取（账号数个位数）。
 func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 	states := p.cfg.Pool.List()
@@ -95,7 +71,7 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 			}
 			it := &items[i]
 			it.UID, it.Nickname = uid, a.Nickname
-			// D4 门控：global 账号无 CN 成长/开学季任务体系，不发起任何上游调用。
+			// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
 			if a.IsGlobal() {
 				return
 			}
@@ -122,26 +98,14 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			if stasks, inPeriod, err := p.cfg.Upstream.SchoolTasks(a); err != nil {
-				it.SchoolErr = err.Error()
-			} else {
-				it.InPeriod = inPeriod
-				for _, t := range stasks {
-					if schoolPending(t) {
-						it.School = append(it.School, schoolTaskView{
-							Code: t.TaskCode, Status: t.Status, Prog: t.Progress, Target: t.TargetCount,
-						})
-					}
-				}
-			}
 		}(i, st.UID)
 	}
 	wg.Wait()
 	pending := 0
 	for _, it := range items {
-		pending += len(it.Growth) + len(it.School)
+		pending += len(it.Growth)
 	}
-	log.Printf("panel: 队列扫描完成：全部账号待办 %d 项（成长+开学季）", pending)
+	log.Printf("panel: 队列扫描完成：全部账号待办 %d 项", pending)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": items, "pending_count": pending})
 }
 
@@ -153,7 +117,7 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 type queueItem struct {
 	UID      string `json:"uid"`
 	Nickname string `json:"nickname"`
-	Kind     string `json:"kind"` // growth | school
+	Kind     string `json:"kind"` // growth
 	Code     string `json:"code"`
 	Status   string `json:"status"` // pending | running | done | skipped | error
 	Message  string `json:"message,omitempty"`
@@ -184,11 +148,10 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Concurrency int  `json:"concurrency"`
 		Growth      bool `json:"growth"`
-		School      bool `json:"school"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	if !body.Growth && !body.School {
-		body.Growth, body.School = true, true
+	if !body.Growth {
+		body.Growth = true
 	}
 	if body.Concurrency < 1 {
 		body.Concurrency = 1
@@ -196,22 +159,39 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 	if body.Concurrency > 4 {
 		body.Concurrency = 4
 	}
+	started, total, seq, msg := p.startGrowthQueue(body.Concurrency, body.Growth)
+	switch {
+	case seq == -1:
+		writeErr(w, http.StatusConflict, msg)
+	case !started:
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": false, "message": msg})
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "total": total, "seq": seq})
+	}
+}
+
+// startGrowthQueue 扫描全部账号待办并启动队列（HTTP「执行全部待办」与调度器
+// growth 时点共用核心）。返回 (started, total, seq, msg)：seq==-1 表示队列
+// 已在执行（冲突）；started=false 时 msg 为无可执行待办的说明。并发夹取
+// [1,4]；growth 开关同 HTTP 入参语义。
+func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, total int, seq int, msg string) {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if concurrency > 4 {
+		concurrency = 4
+	}
 	q := p.queue()
 	q.mu.Lock()
 	if q.running {
 		q.mu.Unlock()
-		writeErr(w, http.StatusConflict, "队列正在执行中（可在任务中心查看进度）")
-		return
+		return false, 0, -1, "队列正在执行中（可在任务中心查看进度）"
 	}
 	q.mu.Unlock()
 
 	// 扫描待办（复用扫描逻辑的拉取部分）。
 	states := p.cfg.Pool.List()
-	type acct struct {
-		a      *auth.Auth
-		grow   []upstream.Task
-		school bool
-	}
+
 	var accts []queueAccount
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -224,14 +204,14 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		wg.Add(1)
-		go func(a *auth.Auth, wantSchool bool) {
+		go func(a *auth.Auth) {
 			defer wg.Done()
 			one := queueAccount{a: a}
-			// D4 门控：global 账号无 CN 成长/开学季任务体系，不发起任何上游调用。
+			// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
 			if a.IsGlobal() {
 				return
 			}
-			if body.Growth {
+			if growth {
 				if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
 					for _, t := range tasks {
 						if growthPending(t) {
@@ -257,22 +237,12 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 					})
 				}
 			}
-			if wantSchool && p.cfg.Scheduler != nil {
-				if stasks, _, err := p.cfg.Upstream.SchoolTasks(a); err == nil {
-					for _, t := range stasks {
-						if schoolPending(t) { // 认证等不可做任务已在口径外
-							one.school = true
-							break
-						}
-					}
-				}
-			}
-			if len(one.grow) > 0 || one.school {
+			if len(one.grow) > 0 {
 				mu.Lock()
 				accts = append(accts, one)
 				mu.Unlock()
 			}
-		}(a, body.School)
+		}(a)
 	}
 	wg.Wait()
 
@@ -282,28 +252,35 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 		for _, t := range one.grow {
 			items = append(items, queueItem{UID: one.a.UID, Nickname: one.a.Nickname, Kind: "growth", Code: t.TaskCode, Status: "pending"})
 		}
-		if one.school {
-			items = append(items, queueItem{UID: one.a.UID, Nickname: one.a.Nickname, Kind: "school", Code: "school_daily", Status: "pending"})
-		}
 	}
 	if len(items) == 0 {
 		log.Printf("panel: 队列启动：无可执行待办（全部账号任务已完成）")
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": false, "message": "全部账号没有待办任务"})
-		return
+		return false, 0, 0, "全部账号没有待办任务"
 	}
 
 	q.mu.Lock()
 	q.running = true
 	q.startedAt = time.Now()
 	q.items = items
-	q.conc = body.Concurrency
+	q.conc = concurrency
 	q.seq++
-	seq := q.seq
+	seq = q.seq
 	q.mu.Unlock()
 
-	go p.runQueueItems(accts, items, body.Concurrency)
-	log.Printf("panel: 队列启动：%d 项（并发 %d，成长 %v 开学季 %v）", len(items), body.Concurrency, body.Growth, body.School)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "total": len(items), "seq": seq})
+	go p.runQueueItems(accts, items, concurrency)
+	log.Printf("panel: 队列启动：%d 项（并发 %d，成长 %v）", len(items), concurrency, growth)
+	return true, len(items), seq, ""
+}
+
+// RunGrowthQueueOnce 调度器 growth 时点回调（sch.SetGrowthHook 挂载）：与
+// 「执行全部待办」按钮完全同管线（成长，串行并发 1）。Sequential 族
+// 每日零点解锁一环，此前只能手动扫描推进；此回调让链条每天自动走一环。
+// 异步执行（startGrowthQueue 启动 goroutine 即返），已在跑/无待办安全跳过。
+func (p *Panel) RunGrowthQueueOnce() {
+	started, total, _, _ := p.startGrowthQueue(1, true)
+	if started {
+		log.Printf("panel: 定时成长任务队列已启动（%d 项）", total)
+	}
 }
 
 // runQueueItems 队列执行主体：按账号分组，账号内串行（per-account 锁），
@@ -350,8 +327,6 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 				switch kind {
 				case "growth":
 					msg, err = p.runGrowthQueued(one.a, code)
-				case "school":
-					msg, err = p.runSchoolQueued(one.a)
 				}
 				if err != nil {
 					p.queueMarkAt(i, "error", err.Error())
@@ -367,9 +342,8 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 
 // queueAccount 队列执行的账号单元（runQueueItems 参数）。
 type queueAccount struct {
-	a      *auth.Auth
-	grow   []upstream.Task
-	school bool
+	a    *auth.Auth
+	grow []upstream.Task
 }
 
 // snapshotAt 锁内读条目三元组（避免锁外持有指针）。
@@ -469,27 +443,6 @@ func (p *Panel) runGrowthQueued(a *auth.Auth, code string) (string, error) {
 	return msg, nil
 }
 
-// runSchoolQueued 单账号开学季闭环（scheduler 四任务 + 抽奖）。
-func (p *Panel) runSchoolQueued(a *auth.Auth) (string, error) {
-	if p.cfg.Scheduler == nil {
-		return "", fmt.Errorf("scheduler 不可用")
-	}
-	p.cfg.Scheduler.RunSchoolAccountNow(a)
-	// 闭环后回读开学季状态做汇总。
-	tasks, _, err := p.cfg.Upstream.SchoolTasks(a)
-	if err != nil {
-		return "闭环已执行（状态回读失败）", nil
-	}
-	done := 0
-	for _, t := range tasks {
-		if t.Status == "claimed" || (t.TaskCode != "task_student_verify" && t.Progress >= t.TargetCount && t.TargetCount > 0) {
-			done++
-		}
-	}
-	log.Printf("panel: 队列 school uid=%s: 闭环完成（%d/%d 项完成）", a.UID, done, len(tasks))
-	return fmt.Sprintf("开学季闭环完成（%d/%d 项已完成，抽奖已抽完）", done, len(tasks)), nil
-}
-
 // tasksQueueStatus 队列状态（轮询用）。
 func (p *Panel) tasksQueueStatus(w http.ResponseWriter, r *http.Request) {
 	q := p.queue()
@@ -506,77 +459,6 @@ func (p *Panel) tasksQueueStatus(w http.ResponseWriter, r *http.Request) {
 		"seq":        q.seq,
 		"items":      items,
 	})
-}
-
-// ---------------------------------------------------------------------------
-// 开学季独立视图
-// ---------------------------------------------------------------------------
-
-// schoolStatus 全账号开学季任务状态（含抽奖余额）。
-func (p *Panel) schoolStatus(w http.ResponseWriter, r *http.Request) {
-	states := p.cfg.Pool.List()
-	type acctView struct {
-		UID      string           `json:"uid"`
-		Nickname string           `json:"nickname"`
-		InPeriod bool             `json:"in_period"`
-		Tasks    []schoolTaskView `json:"tasks"`
-		Chances  int              `json:"chances"`
-		Err      string           `json:"error,omitempty"`
-	}
-	out := make([]acctView, 0, len(states))
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	for _, st := range states {
-		if st.Disabled {
-			continue
-		}
-		a := p.cfg.Pool.AuthByUID(st.UID)
-		if a == nil {
-			continue
-		}
-		wg.Add(1)
-		go func(a *auth.Auth) {
-			defer wg.Done()
-			v := acctView{UID: a.UID, Nickname: a.Nickname}
-			// D4 门控：global 账号无开学季活动，不发起任何上游调用。
-			if a.IsGlobal() {
-				v.Err = "global realm（无开学季活动）"
-				mu.Lock()
-				out = append(out, v)
-				mu.Unlock()
-				return
-			}
-			tasks, inPeriod, err := p.cfg.Upstream.SchoolTasks(a)
-			if err != nil {
-				v.Err = err.Error()
-			} else {
-				v.InPeriod = inPeriod
-				for _, t := range tasks {
-					v.Tasks = append(v.Tasks, schoolTaskView{
-						Code: t.TaskCode, Status: t.Status, Prog: t.Progress, Target: t.TargetCount,
-					})
-				}
-			}
-			v.Chances, _ = p.cfg.Upstream.SchoolChances(a)
-			mu.Lock()
-			out = append(out, v)
-			mu.Unlock()
-		}(a)
-	}
-	wg.Wait()
-	sort.Slice(out, func(i, j int) bool { return out[i].Nickname < out[j].Nickname })
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": out})
-}
-
-// schoolRunAll 一键执行全部账号开学季闭环（异步，进度看任务频道日志）。
-func (p *Panel) schoolRunAll(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Scheduler == nil {
-		writeErr(w, http.StatusNotImplemented, "scheduler not available")
-		return
-	}
-	go p.cfg.Scheduler.RunSchoolNow()
-	log.Printf("panel: 开学季全账号闭环已触发")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
 
 // schoolVouchers 我的券码：逐 CN 账号查开学季 /vouchers（3 并发，与 packages

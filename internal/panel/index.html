@@ -407,6 +407,39 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     font-size: 11px; color: var(--ink-3); }
   .pk-legend span { display: flex; align-items: center; gap: 5px; }
   .pk-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+  .pk-group-summary td { padding: 7px 11px; background: var(--surface-2); }
+  .pk-group-toggle { width: 100%; padding: 4px 0; border: 0; background: transparent;
+    color: var(--ink-2); text-align: left; }
+  .pk-group-toggle:hover:not(:disabled) { border: 0; color: var(--accent); }
+  .pk-hidden-row[hidden] { display: none; }
+  .pk-hidden-row td { color: var(--ink-3); }
+  .pk-expiry-chart { max-height: 260px; overflow-y: auto; overflow-x: hidden;
+    scrollbar-gutter: stable; scrollbar-width: thin; padding-right: 10px;
+    overscroll-behavior: contain; }
+  .pk-expiry-hdr { display: grid; grid-template-columns: 64px minmax(80px, 1fr) 72px;
+    align-items: center; gap: 9px; margin-bottom: 4px; color: var(--ink-3);
+    font-size: 11px; }
+  .pk-expiry-hdr > b { text-align: right; font-weight: 600; }
+  .pk-expiry-row { display: grid; grid-template-columns: 64px minmax(80px, 1fr) 72px;
+    align-items: center; gap: 9px; min-height: 30px; padding-right: 2px; }
+  .pk-expiry-row > span { color: var(--ink-3); font-size: 11.5px; }
+  .pk-expiry-row > b { text-align: right; font: 600 11.5px var(--mono);
+    font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  .pk-expiry-track { display: flex; align-items: stretch; gap: 2px; height: 9px;
+    border-radius: 5px; background: var(--surface-2); overflow: hidden; }
+  .pk-expiry-seg { display: block; min-width: 3px; height: 100%; cursor: default;
+    background: var(--seg-color, var(--accent)); transition: filter .15s, transform .15s; }
+  .pk-expiry-seg:hover { filter: brightness(1.12); transform: scaleY(1.35); }
+  .pk-expiry-legend { display: flex; flex-wrap: wrap; gap: 5px 12px; margin-top: 8px;
+    color: var(--ink-3); font-size: 11px; }
+  .pk-expiry-legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .pk-expiry-legend i { width: 9px; height: 9px; border-radius: 3px; flex: 0 0 9px; }
+  .pk-expiry-foot { margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line-soft);
+    color: var(--ink-3); font-size: 11px; }
+  .pk-expiry-empty { padding: 22px 0; text-align: center; color: var(--ink-3); font-size: 12px; }
+  .pk-card .expirybar { display: flex; height: 5px; border-radius: 3px; overflow: hidden;
+    margin-top: 6px; background: var(--surface-2); }
+  .pk-card .expirybar i { display: block; height: 100%; min-width: 2px; }
 
 </style>
 </head>
@@ -500,21 +533,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <section class="view" id="view-taskscenter" hidden>
       <div class="box">
         <header>
-          <h3>开学季 <span class="hint">09-13 ~ 09-24 · 每日重置</span></h3>
-          <span class="grow"></span>
-          <span class="note" id="schoolSummary"></span>
-          <button class="xs" id="btnSchoolVouchers">查询券码</button>
-          <button class="xs" id="btnSchoolRefresh">刷新</button>
-          <button class="xs primary" id="btnSchoolRunAll">全部账号执行闭环</button>
-        </header>
-        <div class="state" id="schoolState"><span class="dots">加载中</span></div>
-        <div id="schoolList"></div>
-      </div>
-
-      <div class="box">
-        <header>
           <h3>成长任务队列 <span class="hint" id="qcSummary"></span></h3>
           <span class="grow"></span>
+          <button class="xs" id="btnSchoolVouchers" title="开学季抽奖抽中的第三方券码（活动已结束，历史券码仍可查）">查询券码</button>
           <label class="sel-note">并发
             <select id="qcConc"><option value="1" selected>1</option><option value="2">2</option><option value="3">3</option></select>
           </label>
@@ -559,6 +580,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
     <!-- 积分构成 -->
     <section class="view" id="view-packages" hidden>
+      <div class="box">
+        <header>
+          <h3>积分到期分布</h3>
+          <span class="grow"></span>
+          <span class="note">按批次到期日聚合，颜色区分账号</span>
+        </header>
+        <div class="pad"><div id="pkExpiry"></div></div>
+      </div>
+
       <div class="box">
         <header>
           <h3>账号对比</h3>
@@ -660,6 +690,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <button type="button" class="xs" id="btnEye">显示</button></div>
                 <span class="hint">立即生效（含面板自身）</span></label>
             </div>
+            <label class="fld"><span class="lb">单账号明细默认展示条数</span>
+              <input name="package_detail_limit" type="number" min="1" placeholder="5">
+              <span class="hint">积分构成页按最早到期展示，其余未用完包聚合</span></label>
           </div>
         </div>
 
@@ -703,6 +736,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input type="checkbox" name="balance_refresh_enabled"></div>
               <label class="fld"><span class="lb">刷新间隔（分钟）</span>
                 <input name="balance_refresh_minutes" type="number" min="1" placeholder="5"></label>
+            </div>
+            <div class="hr"></div>
+            <div class="grid2">
+              <div class="switch"><span class="lb">成长任务自动执行</span>
+                <input type="checkbox" name="growth_enabled" checked></div>
+              <label class="fld"><span class="lb">执行时点（小时，逗号分隔）</span>
+                <input name="growth_hours" placeholder="1">
+                <span class="hint">每日到点自动「扫描 + 执行全部待办」（Sequential 任务链零点解锁后自动推进，建议零点后）</span></label>
             </div>
           </div>
         </div>
@@ -749,10 +790,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">成本探索窗口</span>
                 <input name="cost_explore_interval" placeholder="30m">
                 <span class="hint">垄断破除：免费层垄断时定期搭车探索未知号；0 关停</span></label>
+              <label class="fld"><span class="lb">快过期路由窗口</span>
+                <input name="expiring_soon" placeholder="168h">
+                <span class="hint">窗口内按最早到期优先；0 关闭</span></label>
               <label class="fld"><span class="lb">会话粘性 TTL</span>
                 <input name="ttl" placeholder="30m">
                 <span class="hint">改动需重启进程</span></label>
             </div>
+            <div class="switch"><span class="lb">快过期积分优先</span>
+              <input type="checkbox" name="prefer_expiring"></div>
           </div>
         </div>
 

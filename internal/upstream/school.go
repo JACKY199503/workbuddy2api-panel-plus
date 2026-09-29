@@ -48,80 +48,6 @@ func (c *Client) schoolJSON(a *auth.Auth, method, path string, body map[string]a
 	return nil
 }
 
-// SchoolTask 开学季任务条目。
-type SchoolTask struct {
-	TaskCode    string `json:"task_code"`
-	Status      string `json:"status"` // pending | completed | claimed
-	Progress    int    `json:"progress"`
-	TargetCount int    `json:"target_count"`
-}
-
-// SchoolTasks 任务列表 + 活动是否在期。
-func (c *Client) SchoolTasks(a *auth.Auth) ([]SchoolTask, bool, error) {
-	var out struct {
-		Tasks    []SchoolTask `json:"tasks"`
-		InPeriod bool         `json:"in_period"`
-	}
-	if err := c.schoolJSON(a, http.MethodGet, "/tasks", nil, &out); err != nil {
-		return nil, false, err
-	}
-	return out.Tasks, out.InPeriod, nil
-}
-
-// SchoolShareComplete 上报「分享完成」（share_invite 判据，实测即点亮）。
-func (c *Client) SchoolShareComplete(a *auth.Auth) error {
-	return c.schoolJSON(a, http.MethodPost, "/tasks/share-complete",
-		map[string]any{"channel": "wechat"}, nil)
-}
-
-// SchoolTaskViewed 标记任务已查看（pending → in_progress）。desktop_chat_1_time
-// 等任务的计数前置：必须先激活（in_progress）后的行为才计数（三账号实测）。
-func (c *Client) SchoolTaskViewed(a *auth.Auth, taskCode string) error {
-	return c.schoolJSON(a, http.MethodPost, "/tasks/"+taskCode+"/viewed", map[string]any{}, nil)
-}
-
-// SchoolClaimTask 领取任务奖励（返回获得的抽奖次数）。
-func (c *Client) SchoolClaimTask(a *auth.Auth, taskCode string) (chanceGranted int, err error) {
-	var out struct {
-		ChanceGranted int `json:"chance_granted"`
-	}
-	if err := c.schoolJSON(a, http.MethodPost, "/tasks/"+taskCode+"/claim", map[string]any{}, &out); err != nil {
-		return 0, err
-	}
-	return out.ChanceGranted, nil
-}
-
-// SchoolChances 当前抽奖次数余额。
-func (c *Client) SchoolChances(a *auth.Auth) (int, error) {
-	var out struct {
-		Chance struct {
-			Balance int `json:"balance"`
-		} `json:"chance"`
-	}
-	if err := c.schoolJSON(a, http.MethodGet, "/config", nil, &out); err != nil {
-		return 0, err
-	}
-	return out.Chance.Balance, nil
-}
-
-// SchoolDraw 抽奖一次，返回奖品描述（prize_code + 积分）。
-func (c *Client) SchoolDraw(a *auth.Auth) (string, error) {
-	var out struct {
-		PrizeCode    string `json:"prize_code"`
-		CreditAmount int    `json:"credit_amount"`
-	}
-	if err := c.schoolJSON(a, http.MethodPost, "/wheel/draw",
-		map[string]any{"draw_uuid": clientToken()}, &out); err != nil {
-		return "", err
-	}
-	if out.CreditAmount > 0 {
-		return fmt.Sprintf("%s +%dc", out.PrizeCode, out.CreditAmount), nil
-	}
-	return out.PrizeCode, nil
-}
-
-// ---- 开学季 chat_3_times / expert_use（2026-09-14 判据破解）----
-// 判据 = v2/report 埋点计数（与成长任务同一事件管道，三账号实测）：
 //   - chat_3_times：3 条 chat_request_send 即 3/3（conversationId 任意、桌面/mp
 //     头族均可计数，无需真实沙箱会话）。
 //   - expert_use：mp 指纹事件链 expert_summon_click + expert_summoned +
@@ -286,43 +212,6 @@ func MiniPlaybookEvents(caseID, caseName string) []map[string]any {
 		send[k] = v
 	}
 	return []map[string]any{cta, send}
-}
-
-// SchoolExpertUseEvents 构造专家召唤+对话事件链（expert_use 判据，三账号实测）。
-// expertID/expertName 为开学季分类专家（16-BackToSchool）。
-func SchoolExpertUseEvents(expertID, expertName, conversationID string) []map[string]any {
-	rid := "wb2api-" + clientToken()
-	return []map[string]any{
-		{
-			"eventCode": "expert_summon_click", "id": expertID, "name": expertID,
-			"expertTitle": expertName, "type": "16-BackToSchool", "position": 0,
-		},
-		{
-			"eventCode": "expert_summoned", "id": expertID, "name": expertID,
-			"expertTitle": expertName,
-		},
-		{
-			"eventCode": "expert_actual_use", "id": expertID, "name": expertID,
-			"expertTitle": expertName, "type": "16-BackToSchool",
-			"characterCount": 14, "expertType": "builtin",
-		},
-		{
-			"eventCode":   "chat_request_send",
-			"inputLength": 14, "isPlan": false, "isAutoExecuteTerminal": false,
-			"isAutoModify": false, "codebaseEnable": false, "maxToken": 0,
-			"maxSteps": 500, "temperature": 0, "maxRetries": 0,
-			"mentionContexts": []any{}, "knowledgeId": []any{}, "knowledgeName": []any{},
-			"codebaseId": "", "mentionContextCount": 0, "command": "",
-			"recommendId": "", "skillId": "", "skillCount": 0, "totalCount": 0,
-			"traceId": rid, "rootRequestId": rid,
-			"parentConversationId": conversationID, "conversationId": conversationID,
-			"messageId": "msg-" + rid[len(rid)-8:],
-			"agentName": "mp", "agentType": "main",
-			"expertId": expertID, "expertName": expertName,
-			"codebuddy.session_id":              conversationID,
-			"codebuddy.conversation_request_id": rid,
-		},
-	}
 }
 
 // ---- 我的券码（#/prizes?tab=vouchers，2026-09-16 接入）----
