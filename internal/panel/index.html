@@ -144,7 +144,7 @@ body {
 .topbar .sep { color: var(--ink-3); }
 .topbar .meta { color: var(--ink-3); font-size: 12px; font-family: var(--mono); }
 .topbar .grow { flex: 1; }
-.view { padding: 22px 24px 60px; max-width: 1180px; width: 100%; }
+.view { padding: 22px 24px 60px; max-width: 1560px; margin: 0 auto; width: 100%; }
 .view[hidden] { display: none; }
 
 /* ── 控件 ─────────────────────────────────────────────────────────── */
@@ -195,6 +195,10 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .box > header h3 .hint { font-size: 11.5px; font-weight: 400; color: var(--ink-3); margin-left: 6px; }
 .box > header .grow { flex: 1; }
 .box > header .note { color: var(--ink-3); font-size: 12px; }
+/* 面板块头部的下拉/输入按内容取宽：全局 input/select 是 width:100%（配置表单要整行），
+   在 header 里会把标题挤成两行、把"近 3 天"这类短选项拉成一整条。 */
+.box > header select, .box > header input { width: auto; }
+.box > header h3 { white-space: nowrap; }
 .box .pad { padding: 17px; }
 
 /* ── 账号表（签名元素：健康色条 + 积分量条）───────────────────────── */
@@ -268,6 +272,15 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .tag.warn { background: var(--warn-soft); color: var(--warn); }
 .tag.bad { background: var(--bad-soft); color: var(--bad); }
 .tag.mute { background: var(--surface-2); color: var(--ink-3); border: 1px solid var(--line); }
+.rate-limits { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; min-width: 210px; }
+.rate-limit {
+  display: flex; align-items: baseline; gap: 6px; padding: 4px 7px;
+  border: 1px solid color-mix(in srgb, var(--warn) 24%, var(--line));
+  border-radius: 6px; background: var(--warn-soft); font-size: 11.5px; line-height: 1.35;
+}
+.rate-limit.model-unavailable { border-color: var(--line); background: var(--surface-2); color: var(--ink-3); }
+.rate-limit b { color: var(--ink); font-family: var(--mono); font-weight: 600; }
+.rate-limit span { color: var(--ink-2); }
 .acts { display: flex; gap: 5px; justify-content: flex-end; white-space: nowrap; }
 .acts button { padding: 3.5px 8px; font-size: 12.5px; white-space: nowrap; flex: none; }
 
@@ -282,6 +295,10 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 #logBox .ln { display: block; }
 #logBox .ln.e { color: var(--bad); }
 #logBox .ln.w { color: var(--warn); }
+#view-logs .box > header { flex-wrap: wrap; }
+#reqSummary, #reqNote { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#reqSummary { flex: 1 1 320px; }
+#reqNote { flex: 0 1 260px; text-align: right; }
 
 /* ── 配置表单 ─────────────────────────────────────────────────────── */
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; }
@@ -367,28 +384,76 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .nav ul { display: flex; padding: 8px; } .nav .sig { border: none; }
   .stat { border-right: none; border-bottom: 1px solid var(--line-soft); }
 }
-  /* ── 用量视图 ───────────────────────────────────────────────── */
-  .uschart { border: 1px solid var(--line-soft); border-radius: 8px; overflow: hidden; }
-  .uschart-hd { display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+  /* ── 用量视图 ─────────────────────────────────────────────────────
+     这一页一屏要放下「两组 KPI + 图表 + 三张表」，所以视觉语言比账号池更轻：
+     卡片用左侧色轨区分语义，数字用等宽体对齐，分隔靠留白而不是更多边框。 */
+  /* KPI 卡：左侧 3px 色轨是唯一的重色，数值大、标签小，扫一眼就能读出量级。 */
+  .kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 10px; padding: 14px 17px 2px; }
+  .kpis.k4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  @media (max-width: 1180px) { .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+  @media (max-width: 700px) { .kpis, .kpis.k4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .kpi {
+    position: relative; min-width: 0; overflow: hidden;
+    background: var(--surface-2); border: 1px solid var(--line-soft);
+    border-radius: 10px; padding: 11px 14px 12px 16px;
+  }
+  .kpi::before {
+    content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+    background: var(--kpi-c, var(--ink-3)); opacity: .9;
+  }
+  .kpi .k { font-size: 11.5px; color: var(--ink-3); white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; }
+  .kpi .v { font: 600 23px/1.15 var(--mono); font-variant-numeric: tabular-nums;
+    letter-spacing: -.02em; margin-top: 5px; white-space: nowrap; }
+  .kpi .s { font-size: 11px; color: var(--ink-3); margin-top: 4px; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; }
+  .kpi.c-accent { --kpi-c: var(--accent); } .kpi.c-accent .v { color: var(--accent); }
+  .kpi.c-ok { --kpi-c: var(--ok); } .kpi.c-ok .v { color: var(--ok); }
+  .kpi.c-warn { --kpi-c: var(--warn); } .kpi.c-warn .v { color: var(--warn); }
+  .kpi.c-bad { --kpi-c: var(--bad); } .kpi.c-bad .v { color: var(--bad); }
+  .kpi.c-mute { --kpi-c: var(--line); }
+  /* 中性但带一点主色：用于 prompt / 平均延迟这类"要看但不抢眼"的指标——
+     纯灰轨在深色主题下几乎看不见，纯主色又会让六张卡都在喊。 */
+  .kpi.c-soft { --kpi-c: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+  /* KPI 内的构成条（总 token 卡的 prompt/completion 占比） */
+  .kpi .kbar { display: flex; height: 4px; border-radius: 3px; overflow: hidden;
+    background: var(--line); margin-top: 7px; }
+  .kpi .kbar i { display: block; height: 100%; min-width: 2px; }
+
+  .uschart { border: 1px solid var(--line-soft); border-radius: 10px; overflow: hidden;
+    background: var(--surface-2); }
+  .uschart-hd { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
     border-bottom: 1px solid var(--line-soft); font-size: 12px; }
-  .uschart-hd .lb { color: var(--ink-2); font-weight: 550; }
-  .uschart-hd .legend { color: var(--ink-3); font-size: 11.5px; display: flex; align-items: center; gap: 5px; }
-  .uschart-hd .sw { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-left: 8px; }
+  .uschart-hd .lb { color: var(--ink-2); font-weight: 600; }
+  .uschart-hd .legend { color: var(--ink-3); font-size: 11.5px; display: flex; align-items: center; gap: 6px; }
+  .uschart-hd .legend .sep { width: 1px; height: 11px; background: var(--line); margin: 0 3px; }
+  .uschart-hd .sw { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
   .uschart-hd .sw-p { background: var(--accent); }
   .uschart-hd .sw-c { background: var(--ok); }
-  .uschart-body { padding: 10px 12px 6px; }
+  .uschart-hd .sw-t { background: var(--warn); }
+  .uschart-body { padding: 8px 10px 4px; }
   .uschart-body svg { display: block; width: 100%; height: auto; }
-  .uschart-body .ax { stroke: var(--line-soft); stroke-width: 1; }
-  .uschart-body .gl { stroke: var(--line-soft); stroke-width: 1; stroke-dasharray: 2 3; opacity: .7; }
+  .uschart-body .ax { stroke: var(--line); stroke-width: 1; }
+  .uschart-body .gl { stroke: var(--line-soft); stroke-width: 1; stroke-dasharray: 2 3; opacity: .75; }
+  .uschart-body .avg { stroke: var(--warn); stroke-width: 1; stroke-dasharray: 4 4; opacity: .55; }
   .uschart-body .tk { fill: var(--ink-3); font: 10px var(--mono); }
-  .uschart-body .us-empty { padding: 28px 0; text-align: center; color: var(--ink-3); font-size: 12.5px; }
-  /* 用量表内的 prompt/completion 小条。必须限定在 .us-wrapbar 内：账号池积分条
-     也叫 .bar（块级容器 + 百分比内条），同优先级下这里的全局 .bar 会覆盖它，
-     把积分条塌成 min-width 的一个小点（v1.9.0 回归）。 */
-  .us-wrapbar .bar { display: inline-block; height: 6px; border-radius: 3px; min-width: 2px; vertical-align: middle; }
-  .us-wrapbar .bar-p { background: var(--accent); }
-  .us-wrapbar .bar-c { background: var(--ok); }
-  .us-wrapbar { display: flex; gap: 2px; align-items: center; min-width: 90px; }
+  .uschart-body .tk-avg { fill: var(--warn); font: 10px var(--mono); opacity: .9; }
+  .uschart-body .tk-peak { fill: var(--ink-2); font: 600 10px var(--mono); }
+  .uschart-body rect.usbar { transition: opacity .12s; }
+  .uschart-body rect.usbar:hover { opacity: .78; }
+  .uschart-body .us-empty { padding: 30px 0; text-align: center; color: var(--ink-3); font-size: 12.5px; }
+
+  /* 用量表内的 prompt/completion 占比条。用 .us-mix 而不是复用账号池的 .bar：
+     全局 .bar 是块级容器（积分条），同优先级下会互相覆盖（v1.9.0 回归）。 */
+  .us-mix { display: flex; height: 3px; border-radius: 2px; overflow: hidden;
+    background: var(--line); margin-top: 5px; min-width: 60px; }
+  .us-mix i { display: block; height: 100%; }
+  .us-mix .p { background: var(--accent); }
+  .us-mix .c { background: var(--ok); }
+  /* 表内 zebra：三张表行数多，靠极淡的交替底色帮眼睛横向对齐。 */
+  .acc.zebra tbody tr:nth-child(even) { background: color-mix(in srgb, var(--surface-2) 55%, transparent); }
+  .acc.zebra tbody tr:hover { background: var(--surface-2); }
 
   /* ── 积分构成 ───────────────────────────────────────────────── */
   .pk-grid { display: flex; flex-wrap: wrap; gap: 10px; }
@@ -440,6 +505,72 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .pk-card .expirybar { display: flex; height: 5px; border-radius: 3px; overflow: hidden;
     margin-top: 6px; background: var(--surface-2); }
   .pk-card .expirybar i { display: block; height: 100%; min-width: 2px; }
+
+  /* ── 筛选栏（模型档位 / 运行日志 / 用量共用）─────────────────────────
+     面板控件默认 input/select 是 width:100%（配置表单要整行），筛选栏里必须显式
+     收回宽度，否则第一个控件会把整行撑满、后面的控件被挤到下一行。 */
+  .fbar {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 10px 17px; border-bottom: 1px solid var(--line-soft); background: var(--surface-2);
+  }
+  .fbar > input, .fbar > select {
+    width: auto; padding: 5px 10px; font-size: 12.5px; border-radius: 6px;
+  }
+  .fbar > input[type=search] { min-width: 200px; flex: 0 1 280px; }
+  .fbar > input[type=search]::-webkit-search-cancel-button { cursor: pointer; }
+  .fbar .grow { flex: 1; }
+  .fbar .flab { color: var(--ink-3); font-size: 12px; white-space: nowrap; }
+  .fbar select { cursor: pointer; }
+  /* 用量总览的头部在「自定义」态会多出两个时间输入框：允许换行，宁可整组折到
+     下一行，也不要把标题挤成两行、把下拉压成窄条。
+     口径说明（#usNote）单行截断而不是折行——它是长文本，一旦允许折行就会在窄屏
+     被挤成一列竖排的碎字，把标题和控件一起带歪；完整内容走 title 悬停看。 */
+  #view-usage .box > header { flex-wrap: wrap; }
+  #view-usage .box > header > .note {
+    flex: 0 1 auto; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #view-usage .box > header > button { flex: none; }
+
+  /* ── 时间范围控件（用量 / 请求记录共用）────────────────────────────
+     预设下拉 + 「自定义」时展开的起止时间。整组是 inline-flex 且允许换行：
+     自定义态下在窄屏会整体折到下一行，而不是把标题挤扁。 */
+  .trange { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .trange .tr-custom { display: inline-flex; align-items: center; gap: 6px; }
+  .trange .tr-sep { color: var(--ink-3); font-size: 12px; }
+  .trange select, .trange input { width: auto; padding: 5px 9px; font-size: 12.5px; border-radius: 6px; }
+  .trange input[type=datetime-local] { font-family: var(--mono); font-size: 12px; }
+  /* 原生日期选择器的弹出面板要跟随明暗主题，否则深色下是一块刺眼的白。 */
+  .trange input[type=datetime-local] { color-scheme: light; }
+  [data-theme="dark"] .trange input[type=datetime-local] { color-scheme: dark; }
+  .trange .tr-bad { border-color: var(--bad); background: var(--bad-soft); }
+
+  /* ── 视图内维度切换（用量「按账号/按模型/按域」等）────────────────── */
+  .vtabs { display: inline-flex; gap: 2px; background: var(--surface-2); border-radius: 8px; padding: 3px; }
+  .vtabs button {
+    padding: 3.5px 13px; border: none; background: transparent; border-radius: 6px;
+    color: var(--ink-3); font: 550 12.5px var(--sans); cursor: pointer;
+  }
+  .vtabs button:hover:not(:disabled) { border: none; color: var(--ink); }
+  .vtabs button.on { background: var(--surface); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.22); }
+  .vtabs .cnt { color: var(--ink-3); font-weight: 400; margin-left: 4px; font-variant-numeric: tabular-nums; }
+  .vtabs button.on .cnt { color: var(--ink-2); }
+
+  /* ── 请求记录表（运行日志）────────────────────────────────────────── */
+  .acc.req { min-width: 1080px; }
+  .acc.req th, .acc.req td { padding: 8px 10px; }
+  .acc.req tbody tr { cursor: default; }
+  /* 请求记录最多可读 1000 条，不限高会把下面的「运行日志」推到很远的地方。
+     限高 + 表头吸顶：滚动区域内始终能看到列名。 */
+  .req-wrap { max-height: 460px; overflow: auto; }
+  .req-wrap thead th { position: sticky; top: 0; background: var(--surface); z-index: 1; }
+  .clip { display: block; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .clip.ip { max-width: 150px; font-family: var(--mono); font-size: 12.5px; }
+  .clip.rid { max-width: 150px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); }
+  .acc.req .muted { color: var(--ink-3); }
+  .src-off { color: var(--warn); }
+
+  /* 用量统计条已改用 .kpis（见「用量视图」段），此处不再保留 .stats.compact 变体。 */
 
 </style>
 </head>
@@ -569,6 +700,46 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="note" id="mdNote">实时查询上游</span>
           <button class="xs" id="btnModels">重新获取</button>
         </header>
+        <div class="fbar" id="mdFilter">
+          <input id="mdQ" type="search" placeholder="搜索模型 ID / 名称 / 描述 / 厂商" aria-label="搜索模型">
+          <select id="mdRealm" aria-label="按域筛选">
+            <option value="">全部域</option>
+            <option value="cn">国内版 CN</option>
+            <option value="global">国际版 Global</option>
+          </select>
+          <select id="mdCap" aria-label="按能力筛选">
+            <option value="">全部能力</option>
+            <option value="tool">支持工具调用</option>
+            <option value="vision">支持视觉</option>
+            <option value="reasoning">支持思考</option>
+            <option value="default">默认模型</option>
+          </select>
+          <select id="mdEffort" aria-label="按思考档位筛选">
+            <option value="">全部档位</option>
+            <option value="off">可关闭思考</option>
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+            <option value="xhigh">xhigh</option>
+            <option value="max">max</option>
+          </select>
+          <select id="mdPromo" aria-label="按价格筛选">
+            <option value="">全部价格</option>
+            <option value="promo">有折扣 / 限时免费</option>
+            <option value="free">限时免费</option>
+            <option value="discount">打折（非免费）</option>
+          </select>
+          <select id="mdSort" aria-label="排序方式">
+            <option value="default">上游默认顺序</option>
+            <option value="rate">积分倍率 低 → 高</option>
+            <option value="context">上下文长度 大 → 小</option>
+            <option value="output">最大输出 大 → 小</option>
+            <option value="name">模型 ID A → Z</option>
+          </select>
+          <span class="grow"></span>
+          <span class="note" id="mdCount"></span>
+          <button class="xs ghost" id="mdReset" title="清空全部筛选条件">重置</button>
+        </div>
         <div class="tbl-wrap">
         <table class="acc md">
           <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th><th>默认档</th><th>支持的思考档位</th><th>上下文长度</th><th>最大输出</th></tr></thead>
@@ -608,22 +779,20 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <h3>用量总览</h3>
           <span class="grow"></span>
           <span class="note" id="usNote">—</span>
-          <select id="usWindow" class="xs">
-            <option value="24">近 24 小时</option>
-            <option value="72" selected>近 3 天</option>
-            <option value="168">近 7 天</option>
-            <option value="720">近 30 天</option>
-            <option value="0">全部历史</option>
-          </select>
+          <span class="trange" id="usRange"></span>
           <button class="xs" id="btnUsage">刷新</button>
         </header>
-        <div class="stats" id="usStats"></div>
+        <div class="kpis" id="usStats"></div>
         <div class="pad">
           <div class="uschart">
             <div class="uschart-hd">
               <span class="lb">Token 时序</span>
+              <span class="note" id="usChartNote">—</span>
               <span class="grow"></span>
-              <span class="legend"><i class="sw sw-p"></i>prompt<i class="sw sw-c"></i>completion</span>
+              <span class="legend">
+                <i class="sw sw-p"></i>prompt<i class="sw sw-c"></i>completion
+                <span class="sep"></span><i class="sw sw-t"></i>均值
+              </span>
             </div>
             <div id="usChart" class="uschart-body"></div>
           </div>
@@ -631,45 +800,47 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
 
       <div class="box">
-        <header><h3>按账号</h3><span class="grow"></span>
-          <span class="note">请求数含失败尝试</span></header>
+        <header>
+          <h3>用量明细</h3>
+          <span class="vtabs" id="usDimTabs">
+            <button data-dim="account" class="on">按账号</button>
+            <button data-dim="model">按模型</button>
+            <button data-dim="realm">按域</button>
+          </span>
+          <span class="grow"></span>
+          <span class="note" id="usDimNote">—</span>
+          <label class="sel-note">排序
+            <select id="usSort">
+              <option value="total">合计 Token</option>
+              <option value="requests">请求数</option>
+              <option value="errors">失败数</option>
+              <option value="latency">平均延迟</option>
+            </select>
+          </label>
+        </header>
         <div class="tbl-wrap">
-          <table class="acc">
-            <thead><tr>
-              <th class="mark" aria-hidden="true"></th><th>账号</th><th>域</th>
-              <th class="num">请求</th><th class="num">失败</th>
-              <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
-              <th class="num">均延迟</th><th class="num">均速率</th>
-            </tr></thead>
-            <tbody id="usAccBody"></tbody>
+          <table class="acc zebra">
+            <thead id="usDimHead"></thead>
+            <tbody id="usDimBody"></tbody>
           </table>
         </div>
       </div>
 
       <div class="box">
-        <header><h3>按模型</h3></header>
+        <header>
+          <h3>积分扣除历史</h3>
+          <span class="vtabs" id="usCreditTabs">
+            <button data-dim="account" class="on">按账号</button>
+            <button data-dim="model">按模型</button>
+          </span>
+          <span class="grow"></span>
+          <span class="note" id="usCreditNote">—</span>
+        </header>
+        <div class="kpis k4" id="usCreditStats"></div>
         <div class="tbl-wrap">
-          <table class="acc">
-            <thead><tr>
-              <th class="mark" aria-hidden="true"></th><th>模型</th>
-              <th class="num">请求</th><th class="num">失败</th>
-              <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
-            </tr></thead>
-            <tbody id="usModelBody"></tbody>
-          </table>
-        </div>
-      </div>
-
-      <div class="box">
-        <header><h3>按域</h3></header>
-        <div class="tbl-wrap">
-          <table class="acc">
-            <thead><tr>
-              <th class="mark" aria-hidden="true"></th><th>realm</th>
-              <th class="num">请求</th><th class="num">失败</th>
-              <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
-            </tr></thead>
-            <tbody id="usRealmBody"></tbody>
+          <table class="acc zebra">
+            <thead id="usCreditHead"></thead>
+            <tbody id="usCreditBody"></tbody>
           </table>
         </div>
       </div>
@@ -790,6 +961,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">成本探索窗口</span>
                 <input name="cost_explore_interval" placeholder="30m">
                 <span class="hint">垄断破除：免费层垄断时定期搭车探索未知号；0 关停</span></label>
+              <label class="fld"><span class="lb">积分保底</span>
+                <input name="credit_floor" type="number" min="0" placeholder="100">
+                <span class="hint">余额低于此值不再接实测收费模型（保住免费模型可用）；0 关闭</span></label>
               <label class="fld"><span class="lb">快过期路由窗口</span>
                 <input name="expiring_soon" placeholder="168h">
                 <span class="hint">窗口内按最早到期优先；0 关闭</span></label>
@@ -880,6 +1054,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </div>
         </div>
 
+        <div class="box">
+          <header><h3>日志</h3></header>
+          <div class="pad">
+            <div class="switch"><span class="lb">记录调用来源（客户端 IP / User-Agent）</span>
+              <input type="checkbox" name="request_client_info"></div>
+            <div class="hint">开启后，「运行日志」页的请求记录会显示每次调用来自哪个 IP、用什么客户端；
+              关闭则归档与面板都不再出现来源信息。改动即时生效，无需重启。</div>
+            <div class="hint" style="margin-top:8px">归档开关、保留天数与容量上限（<code>logging.request_archive_*</code>）需手工编辑配置文件。</div>          </div>
+        </div>
+
         <div class="savebar">
           <span class="grow"></span>
           <span class="restart-note" id="cfgNote"></span>
@@ -891,6 +1075,44 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
     <!-- 日志 -->
     <section class="view" id="view-logs" hidden>
+      <div class="box">
+        <header>
+          <h3>请求记录 <span class="hint">调用来源：IP 取 X-Forwarded-For 首段，无代理头时回落 TCP 对端</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="reqSummary">—</span>
+          <span class="note" id="reqNote">—</span>
+        </header>
+        <div class="fbar" id="reqFilter">
+          <input id="reqQ" type="search" placeholder="搜索 IP / UA / 模型 / 账号 / 请求 ID" aria-label="搜索请求记录">
+          <select id="reqOutcome" aria-label="按结果筛选">
+            <option value="">全部结果</option>
+            <option value="success">成功</option>
+            <option value="http_error">HTTP 错误</option>
+            <option value="stream_error">流错误</option>
+            <option value="interrupted">中断</option>
+          </select>
+          <span class="trange" id="reqRange"></span>
+          <select id="reqLimit" aria-label="读取条数">
+            <option value="100" selected>最近 100 条</option>
+            <option value="300">最近 300 条</option>
+            <option value="1000">最近 1000 条</option>
+          </select>
+          <span class="grow"></span>
+          <span class="note" id="reqCount">—</span>
+          <button class="xs" id="btnReqReload">重新读取</button>
+        </div>
+        <div class="tbl-wrap req-wrap">
+          <table class="acc req">
+            <thead><tr>
+              <th>时间</th><th>结果</th><th>模型</th><th>账号</th>
+              <th>来源 IP</th><th>User-Agent</th>
+              <th class="num">耗时</th><th class="num">Token</th><th class="num">积分</th><th>请求 ID</th>
+            </tr></thead>
+            <tbody id="reqBody"></tbody>
+          </table>
+        </div>
+      </div>
+
       <div class="box">
         <header>
           <h3>运行日志</h3>

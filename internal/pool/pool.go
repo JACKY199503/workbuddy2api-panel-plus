@@ -42,6 +42,13 @@ type Pool struct {
 	degradeThreshold   int
 	degradeCooldown    time.Duration
 	degradeCooldownMax time.Duration
+	// creditFloor 积分保底（SetCreditFloor 注入；0 = 关闭，缺省即现状）。
+	// 账号 credits < floor 时对**实测收费**模型（tier 2，账本有效观测）不再参与
+	// 选号——防止收费请求把余额打穿、连免费模型都 402 冷却到次日签到。tier 0/1
+	// 不受限（保底保的是「还有余额可用」，不是「什么都别调」）；签到回血
+	// （SetCreditsDetailed）越过 floor 即自动恢复。全池触底 + 全 tier 2 时选号
+	// 返回 nil（硬语义：宁 503 不打穿，放行=回到「烧到 0」现状）。
+	creditFloor int64
 	// 加权路由的闲置补偿调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
@@ -194,6 +201,24 @@ func (p *Pool) SetDegrade(threshold int, cooldown, cooldownMax time.Duration) {
 	}
 	if cooldownMax > 0 {
 		p.degradeCooldownMax = cooldownMax
+	}
+}
+
+// CreditFloor 透出生效的积分保底值（/status 用）。0 = 关闭。
+func (p *Pool) CreditFloor() int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.creditFloor
+}
+
+// SetCreditFloor 注入积分保底线（main 从 config 解析后调用）。
+// 0 = 关闭（缺省即现状，零回归）；负值非法保留原值（0）。
+// 语义见 Pool.creditFloor 字段注释。
+func (p *Pool) SetCreditFloor(n int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if n >= 0 {
+		p.creditFloor = n
 	}
 }
 

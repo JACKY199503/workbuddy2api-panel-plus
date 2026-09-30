@@ -24,6 +24,7 @@ type Snapshot struct {
 	// 收编进 live 的原因：面板在线改配置后立即生效，不必重启网关（编排是纯读路径
 	// 决策，每次请求现取现用，无装配期依赖）。零值 = 未启用（行为与引入前一致）。
 	Auto autoroute.Config
+	RecordClientInfo     bool          // 请求日志是否记录调用来源（客户端 IP / UA）
 }
 
 // Holder 原子持有当前快照。
