@@ -32,7 +32,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.11.10-panel"
+const appVersion = "1.11.11-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -133,6 +133,13 @@ func main() {
 	}
 
 	up := upstream.New()
+
+	// 积分保底的「收费」兜底判据：接上游模型目录的积分倍率表。本地实测台账无观测
+	// 时用它判收费——否则「没学过」恒等于「放行」，高价新模型会把触底号一笔打穿
+	// （kimi-k3-1 实案：全池无观测 → 保底全放行 → 两笔打穿并硬冷却到次日 04:00）。
+	// 位于 up 装配之后：倍率表由探测下发，闭包每次调用读实时快照。
+	p.SetModelRateOf(func(realm, model string) string { return up.ModelRate(realm, model) })
+
 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	// 聊天 SSE 首字节前（响应头）上限：cfg 已 normalize（缺省回落 timeout_seconds）。
@@ -314,6 +321,14 @@ func main() {
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 
+	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
+	// 填充（两者均懒触发），重启后到首次 /v1/models 或面板模型页被访问之前，
+	// ModelRate 恒返回空串——积分保底的目录兜底在这段空窗期内形同虚设，触底号
+	// 会被当成「收费未知」放行并打穿（实测：重启后 2 分钟，97 分的账号打收费
+	// 模型归零；倍率表当时尚未建立）。
+	// 异步执行：不阻塞监听启动；失败仅记日志（下一轮懒触发或本轮重试仍可补上）。
+	go warmModelRates(ctx, up, p)
+
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           h,
@@ -340,6 +355,46 @@ func main() {
 		log.Fatalf("http: %v", err)
 	}
 	log.Printf("bye")
+}
+
+// warmModelRates 启动预热各域模型积分倍率表（供积分保底的目录兜底判定）。
+//
+// 为什么需要：倍率表只在 FetchModels（CN）/ FetchGlobalModelInfos（global）成功时
+// 填充，两者都是懒触发（被 /v1/models 或面板模型页访问才跑）。重启后到首次触发
+// 之间的空窗期里 ModelRate 恒返回空串，保底的目录兜底判不出收费，触底号会被
+// 当成「收费未知」放行并打穿（实测：重启后 2 分钟，97 分的账号打收费模型归零）。
+//
+// 失败处理：单域失败只记 WARN（不阻塞、不致命——后续懒触发仍会补上）；global 域
+// 仅在其路由开关开启时预热（逃生门关锁时按 CN 处理，无需探测）。
+func warmModelRates(ctx context.Context, up *upstream.Client, p *pool.Pool) {
+	// 预热不得拖住进程退出：ctx 取消（SIGINT/SIGTERM）时立刻放弃剩余域。
+	if ctx.Err() != nil {
+		return
+	}
+	// CN：有可用 CN 账号才拉（与面板 models 同口径，避免无谓上游调用）。
+	if uids := p.AvailableUIDsForRealm("cn"); len(uids) > 0 {
+		if a := p.AuthByUID(uids[0]); a != nil {
+			if _, err := up.FetchModels(a); err != nil {
+				log.Printf("WARN: [upstream] warm model rates (cn): %v", err)
+			} else {
+				log.Printf("[upstream] warm model rates: cn ok")
+			}
+		}
+	}
+	// global：独立目录端点（workbuddy.ai），倍率按 "global" 域键存储。
+	if up.GlobalEnabled && ctx.Err() == nil {
+		if uids := p.AvailableUIDsForRealm("global"); len(uids) > 0 {
+			if a := p.AuthByUID(uids[0]); a != nil {
+				// FetchGlobalModelInfos 无错误返回（内部负缓存自行节流），
+				// 仅按结果条数判断是否拿到目录。
+				if infos := up.FetchGlobalModelInfos(a); len(infos) == 0 {
+					log.Printf("WARN: [upstream] warm model rates (global): empty model list")
+				} else {
+					log.Printf("[upstream] warm model rates: global ok (%d models)", len(infos))
+				}
+			}
+		}
+	}
 }
 
 // panelListenPath 从 listen 地址提取 ":port" 形式，用于启动日志拼面板 URL

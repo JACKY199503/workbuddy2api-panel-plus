@@ -827,6 +827,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				HasTotal:         delta.HasTotalTokens,
 				Credit:           credit,
 				HasCredit:        hasCredit,
+				HasCacheTokens:   st.hasCache,
+				CacheHitTokens:   st.cacheHit,
+				CacheMissTokens:  st.cacheMiss,
 				ModelRate:        modelRate,
 				LatencyMs:        delta.LatencyMs,
 				HasLatency:       delta.HasLatencyMs,
@@ -1148,7 +1151,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeSuccess
 			}
 			credit, hasCredit := stats.Credit()
+			if hit, miss, ok := stats.CacheTokens(); ok {
+				st.cacheHit, st.cacheMiss, st.hasCache = hit, miss, true
+			}
 			recordAttempt(acct.UID, stats.Usage(), credit, hasCredit, attemptStarted)
+			// WARN 信号放 recordAttempt 之后：st.promptTokens 此时才是本次的观测值。
+			if st.hasCache {
+				cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
+			}
 			st.ttfb = stats.TTFB()
 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
 			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
@@ -1187,12 +1197,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		credit, total, hasCredit := usageCreditTotal(resp)
+		if usage, ok := resp["usage"].(map[string]any); ok {
+			if hit, okH := upstream.UsageCacheHitTokens(usage); okH {
+				miss, _ := upstream.UsageCacheMissTokens(usage)
+				st.cacheHit, st.cacheMiss, st.hasCache = int64(hit), int64(miss), true
+			}
+		}
 		recordAttempt(acct.UID, usageDeltaFromResponse(resp), credit, hasCredit, attemptStarted)
+		if st.hasCache {
+			cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
+		}
 		// 编排生效时透出实际模型（非流式分支；流式分支在同名字段处设置）。
 		if chain[ci] != peek.Model {
 			w.Header().Set("X-WB2A-Routed-Model", chain[ci])
 		}
-		recordAttempt(acct.UID, usageDeltaFromResponse(resp), credit, hasCredit, attemptStarted)
 		// 空回复降级（config.auto_model.on_empty，默认开）：上游 200 但正文为空
 		// ——部分模型默认 reasoning_effort=max，思考 token 吃满 max_tokens 预算，
 		// 于是返回 200 + 空 content 且不报错（issue #31 点名的坑）。此时响应尚未

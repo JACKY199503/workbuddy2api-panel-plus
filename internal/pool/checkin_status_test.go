@@ -74,3 +74,39 @@ func TestCheckinDoneExpiredYesterday(t *testing.T) {
 		t.Fatal("昨日签到记录不应显示为今日已签")
 	}
 }
+
+// TestSetNicknamePersists（issue #94）：昵称更新写入 auths 文件并往返无损；
+// 未变化不写盘；空昵称/未知 uid 拒绝。
+func TestSetNicknamePersists(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "workbuddy-u1.json")
+	a := &auth.Auth{UID: "u1", Nickname: "旧名字", AccessToken: "at", FilePath: fp}
+	p := New("")
+	p.Add(a)
+	if !p.SetNickname("u1", "新名字") {
+		t.Fatal("昵称变化应返回 true")
+	}
+	reloaded, err := auth.Parse(mustRead(t, fp))
+	if err != nil || reloaded.Nickname != "新名字" {
+		t.Fatalf("回写后昵称=%q err=%v, want 新名字", reloaded.Nickname, err)
+	}
+	if p.SetNickname("u1", "新名字") {
+		t.Fatal("未变化不应再写盘")
+	}
+	if p.SetNickname("u1", "") || p.SetNickname("no-such", "x") {
+		t.Fatal("空昵称/未知 uid 应拒绝")
+	}
+	st, _ := p.Status("u1")
+	if st.Nickname != "新名字" {
+		t.Fatalf("Status 昵称=%q, want 新名字", st.Nickname)
+	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}

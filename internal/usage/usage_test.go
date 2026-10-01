@@ -302,3 +302,54 @@ func TestLifecycleFlush(t *testing.T) {
 		t.Fatalf("Stop 后应有落盘文件: %v", err)
 	}
 }
+
+// TestCacheHitRateAccumulation（issue #92）：桶累计 hit/miss，credit_by_model
+// 与 totals 输出命中率；无缓存观测的桶不参与（rate 零值省略）。
+func TestCacheHitRateAccumulation(t *testing.T) {
+	r := New(t.TempDir() + "/usage.json")
+	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.Local)
+	r.Add(base, "cn", "u1", "glm-5.3", Delta{
+		PromptTokens: 1000, HasPromptTokens: true,
+		Credit: 1, HasCredit: true, TotalTokens: 1005, HasTotal: true,
+		HasCacheTokens: true, CacheHitTokens: 900, CacheMissTokens: 100,
+	}, true)
+	r.Add(base.Add(time.Minute), "cn", "u1", "glm-5.3", Delta{
+		PromptTokens: 1000, HasPromptTokens: true,
+		Credit: 2, HasCredit: true, TotalTokens: 1004, HasTotal: true,
+		HasCacheTokens: true, CacheHitTokens: 100, CacheMissTokens: 900,
+	}, true)
+	snap := r.Snapshot(0, nil)
+	if got := snap.CreditByModel[0].CacheHitRate; got != 50 {
+		t.Fatalf("cache_hit_rate=%v want 50", got)
+	}
+	if snap.Totals.CacheHitRate != 50 {
+		t.Fatalf("totals cache_hit_rate=%v want 50", snap.Totals.CacheHitRate)
+	}
+	if snap.CreditByModel[0].CacheHitTokens != 1000 || snap.CreditByModel[0].CacheMissTokens != 1000 {
+		t.Fatalf("hit/miss 累计错误: %+v", snap.CreditByModel[0])
+	}
+
+	// 无缓存观测的桶：rate 零值。
+	r2 := New(t.TempDir() + "/usage2.json")
+	r2.Add(base, "cn", "u1", "m", Delta{PromptTokens: 10, HasPromptTokens: true, Credit: 1, HasCredit: true, TotalTokens: 12, HasTotal: true}, true)
+	if got := r2.Snapshot(0, nil).CreditByModel[0].CacheHitRate; got != 0 {
+		t.Fatalf("无缓存观测应 rate=0, got %v", got)
+	}
+}
+
+// TestCacheTokensPersistRoundtrip：ch/cm 落盘 v4 并无损恢复。
+func TestCacheTokensPersistRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	r := New(dir + "/usage.json")
+	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.Local)
+	r.Add(base, "cn", "u1", "m", Delta{
+		Credit: 1, HasCredit: true, TotalTokens: 100, HasTotal: true,
+		HasCacheTokens: true, CacheHitTokens: 75, CacheMissTokens: 25,
+	}, true)
+	r.Save()
+	r2 := New(dir + "/usage.json")
+	snap := r2.Snapshot(0, nil)
+	if snap.CreditByModel[0].CacheHitRate != 75 {
+		t.Fatalf("恢复后 cache_hit_rate=%v want 75", snap.CreditByModel[0].CacheHitRate)
+	}
+}

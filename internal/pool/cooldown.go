@@ -4,6 +4,7 @@
 package pool
 
 import (
+	"log"
 	"strings"
 	"time"
 )
@@ -16,6 +17,36 @@ func (p *Pool) SetCredits(uid string, credits, total int64) {
 		e.creditsTotal = total
 		p.dirty.Store(true)
 	}
+}
+
+// SetNickname 更新账号昵称并回写 auths 凭证文件（issue #94：上游改名后同步）。
+// 昵称未变化时不写盘；uid 不存在 / 昵称为空返回 false。与 token 刷新共用
+// auth 自身的锁与 SaveAtomic 原子写，无半更新窗口。
+func (p *Pool) SetNickname(uid, nickname string) bool {
+	if uid == "" || nickname == "" {
+		return false
+	}
+	p.mu.RLock()
+	e, ok := p.byUID[uid]
+	p.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	a := e.a
+	a.Lock()
+	changed := a.Nickname != nickname
+	if changed {
+		a.Nickname = nickname
+	}
+	a.Unlock()
+	if !changed {
+		return false
+	}
+	if err := a.SaveAtomic(); err != nil {
+		log.Printf("WARN: [pool] nickname save %s: %v", uid, err)
+		return false
+	}
+	return true
 }
 
 // NoteCheckinDone 标记账号今日已签到（签到成功与上游"今天已签到"幂等拒绝均算）。

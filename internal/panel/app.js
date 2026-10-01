@@ -853,8 +853,17 @@ function requestLogText(e) {
     fmtMs(e && e.duration_ms),
     fmtTok(token) + ' tok',
     credit,
+    cacheRateText(e && e.cache_hit_tokens, e && e.cache_miss_tokens) === '—' ? '' : '命中 ' + cacheRateText(e && e.cache_hit_tokens, e && e.cache_miss_tokens),
     e && e.request_id || '—',
-  ].join(' | ');
+  ].filter(Boolean).join(' | ');
+}
+
+/* 缓存命中率纯文本（issue #92）：requestLogText 与积分表/kpi 卡共用。
+   自包含（不依赖 trimFixed）：前端纯函数切片测试只截取本段。 */
+function cacheRateText(hit, miss) {
+  const h = Number(hit || 0), m = Number(miss || 0), total = h + m;
+  if (!total) return '—';
+  return String(Math.round(h / total * 1000) / 10) + '%';
 }
 
 function fmtBytes(bytes) {
@@ -1878,10 +1887,21 @@ function usCreditHead(dim) {
   return dim === 'model'
     ? '<tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th>' +
       '<th class="num">请求</th><th class="num">扣除积分</th>' +
-      '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th></tr>'
+      '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>'
     : '<tr><th class="mark" aria-hidden="true"></th><th>账号</th>' +
       '<th class="num">请求</th><th class="num">扣除积分</th>' +
-      '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th></tr>';
+      '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>';
+}
+
+/* 缓存命中率（issue #92）：颜色即健康度——≥90% 绿 / 80–90% 黄 / <80% 红，
+   样本不足灰。title 带命中/未命中绝对量，供逐项核对。 */
+function cacheRateCell(hit, miss) {
+  const h = Number(hit || 0), m = Number(miss || 0), total = h + m;
+  if (!total) return '<span class="muted">—</span>';
+  const pct = h / total * 100;
+  const color = pct >= 90 ? 'var(--ok)' : (pct >= 80 ? 'var(--warn)' : 'var(--bad)');
+  const txt = trimFixed(pct.toFixed(1)) + '%';
+  return '<span style="color:' + color + '" title="命中 ' + fmtTok(h) + ' / 未命中 ' + fmtTok(m) + ' tok">' + txt + '</span>';
 }
 
 function renderCreditDim() {
@@ -1899,8 +1919,9 @@ function renderCreditDim() {
         '<td class="num">' + fmtCredit(row.credits) + '</td>' +
         '<td class="num">' + fmtTok(row.credit_tokens) + '</td>' +
         '<td class="num">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
+        '<td class="num">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
       '</tr>'
-    ).join('') || '<tr><td colspan="7" class="empty">' + empty + '</td></tr>';
+    ).join('') || '<tr><td colspan="8" class="empty">' + empty + '</td></tr>';
   } else {
     const accounts = d.credit_by_account || [];
     $('usCreditBody').innerHTML = accounts.map(row => {
@@ -1913,8 +1934,9 @@ function renderCreditDim() {
         '<td class="num">' + fmtCredit(row.credits) + '</td>' +
         '<td class="num">' + fmtTok(row.credit_tokens) + '</td>' +
         '<td class="num">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
+        '<td class="num">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
         '</tr>';
-    }).join('') || '<tr><td colspan="6" class="empty">' + empty + '</td></tr>';
+    }).join('') || '<tr><td colspan="7" class="empty">' + empty + '</td></tr>';
   }
   $('usCreditTabs').innerHTML = usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, {
     account: (d.credit_by_account || []).length,
@@ -1971,7 +1993,9 @@ function renderUsage(d) {
     usKpi(fmtTok(t.credit_tokens), '匹配 Token', 'c-mute', '与积分同时观测到的 Token') +
     usKpi(fmtCreditRatio(t.credits_per_1m_tokens, t.credit_samples, t.credit_tokens),
       '平均积分 / 1M Token', 'c-ok', '越低越划算') +
-    usKpi(String(t.credit_samples || 0), '有效积分样本', 'c-mute', '缺字段的历史不参与折算');
+    usKpi(String(t.credit_samples || 0), '有效积分样本', 'c-mute', '缺字段的历史不参与折算') +
+    usKpi(cacheRateText(t.cache_hit_tokens, t.cache_miss_tokens), '缓存命中率', 'c-mute',
+      '上游前缀缓存命中 / (命中+未命中)；低命中意味着费用数倍放大');
   $('usCreditNote').textContent =
     (usageData.credit_by_account || []).length + ' 个账号 · ' +
     (usageData.credit_by_model || []).length + ' 个模型倍率分组 · 仅统计与积分同时观测到的 Token';

@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -57,6 +59,11 @@ type chatStat struct {
 	promptTokens     int64
 	completionTokens int64
 	totalTokens      int64
+	// 缓存命中观测（usage.prompt_cache_hit_tokens / miss）：上游给到才有效。
+	// 供 usage 桶命中率维度与 reqlog 逐次记录；缺失时 hasCache=false 不参与统计。
+	cacheHit  int64
+	cacheMiss int64
+	hasCache  bool
 
 	// 调用来源（客户端 IP / User-Agent）。空 = 未采集（logging.request_client_info
 	// 关闭，或非 chat 路径），展示层一律以 "-" 兜底。
@@ -103,7 +110,13 @@ type chatStatsReader struct {
 	hasCredit  bool
 	credit     float64
 	errorFrame bool
-	pend       []byte // 已读未返回的行缓存
+	// cacheHit/cacheMiss 上游末帧 usage.prompt_cache_hit_tokens / miss_tokens，
+	// 供用量桶的命中率维度与 reqlog 逐次记录（issue #92）。
+	hasCacheHit  bool
+	cacheHit     int
+	cacheMiss    int
+	hasCacheMiss bool
+	pend         []byte // 已读未返回的行缓存
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -152,10 +165,12 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	var chunk struct {
 		Error json.RawMessage `json:"error"`
 		Usage *struct {
-			PromptTokens     *int     `json:"prompt_tokens"`
-			CompletionTokens *int     `json:"completion_tokens"`
-			TotalTokens      *int     `json:"total_tokens"`
-			Credit           *float64 `json:"credit"`
+			PromptTokens         *int     `json:"prompt_tokens"`
+			CompletionTokens     *int     `json:"completion_tokens"`
+			TotalTokens          *int     `json:"total_tokens"`
+			Credit               *float64 `json:"credit"`
+			PromptCacheHitTokens *int     `json:"prompt_cache_hit_tokens"`
+			PromptCacheMissTok   *int     `json:"prompt_cache_miss_tokens"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
@@ -183,6 +198,31 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.hasCredit = true
 		s.credit = *chunk.Usage.Credit
 	}
+	if chunk.Usage.PromptCacheHitTokens != nil {
+		s.hasCacheHit = true
+		s.cacheHit = *chunk.Usage.PromptCacheHitTokens
+	}
+	if chunk.Usage.PromptCacheMissTok != nil {
+		s.hasCacheMiss = true
+		s.cacheMiss = *chunk.Usage.PromptCacheMissTok
+	}
+}
+
+// CacheTokens 返回末帧 usage 的缓存命中 / 未命中 token 数。miss 缺失时按
+// prompt - hit 推导；hit 与 miss 均不可得时 ok=false（不参与命中率统计）。
+func (s *chatStatsReader) CacheTokens() (hit, miss int64, ok bool) {
+	if !s.hasCacheHit {
+		return 0, 0, false
+	}
+	hit = int64(s.cacheHit)
+	miss = int64(s.cacheMiss)
+	if !s.hasCacheMiss {
+		if !s.hasPromptTokens || s.promptTokens < s.cacheHit {
+			return hit, 0, true
+		}
+		miss = int64(s.promptTokens - s.cacheHit)
+	}
+	return hit, miss, true
 }
 
 // SawErrorFrame 报告流中是否透传过 SSE error 帧。
@@ -380,6 +420,8 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.TotalTokens = s.totalTokens
 		e.Credit = s.credit
 		e.HasCredit = s.hasCredit
+		e.CacheHitTokens = s.cacheHit
+		e.CacheMissTokens = s.cacheMiss
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent
@@ -513,4 +555,50 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 		extra,
 		src,
 	)
+}
+
+// cacheMissSignal 低命中率告警信号（issue #92 P1 轻量化）：同一模型此前观测到过
+// 命中、本次大前缀（≥1000 tok）整段未命中（命中率 <10%）时打一条 WARN，每模型
+// 10 分钟冷却。只报「本可命中却重算」的可行动信号——新模型/新会话的首请求天然
+// 全 miss，不在此列。
+type cacheMissSignal struct {
+	mu      sync.Mutex
+	everHit map[string]bool
+	last    map[string]time.Time
+}
+
+var cacheMissWarn = &cacheMissSignal{everHit: map[string]bool{}, last: map[string]time.Time{}}
+
+// cacheMissWarnEvery 冷却间隔；变量供测试缩短。
+var cacheMissWarnEvery = 10 * time.Minute
+
+// noteCacheTokens 记录一次观测：有命中 → 标记该模型可命中；整段未命中且此前
+// 命中过 → 触发 WARN（冷却内不重复）。
+func (c *cacheMissSignal) noteCacheTokens(model string, prompt, hit, miss int64) {
+	if model == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if hit > 0 {
+		c.everHit[model] = true
+		return
+	}
+	// hit==0 才可能是整段重算。小前缀（<1000 tok）的 miss 无告警价值；上游未回
+	// miss 字段时按 prompt 全量视为未命中。
+	if prompt < 1000 {
+		return
+	}
+	if miss <= 0 {
+		miss = prompt
+	}
+	if !c.everHit[model] {
+		return
+	}
+	now := time.Now()
+	if t, ok := c.last[model]; ok && now.Sub(t) < cacheMissWarnEvery {
+		return
+	}
+	c.last[model] = now
+	log.Printf("WARN: [server] cache miss: model=%s 本次大前缀未命中（prompt=%d miss=%d，此前观测到过命中）；上游前缀缓存重算，费用会显著升高", model, prompt, miss)
 }
