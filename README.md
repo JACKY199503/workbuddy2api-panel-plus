@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>把腾讯 CodeBuddy 账号变成 OpenAI 兼容 API 的多账号网关 · 附 Web 管理面板</b><br>
-  本仓库在上游之上<b>只新增三项功能</b>：🔑 API 密钥分发 · 🧠 模型编排 · 🔌 多协议接入
+  在上游之上<b>只新增三项功能</b>：🔑 API 密钥分发 · 🧠 模型编排 · 🔌 多协议接入
 </p>
 
 <p align="center">
@@ -20,20 +20,11 @@
 
 ## 这是什么
 
-三层 fork，**上游的全部能力一个没动**，只在其上加了密钥分发、模型编排与多协议接入：
+上游是 [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) —— CodeBuddy 多账号网关 + Web 面板。本仓库**上游功能一个没动**，只在其上加了三项：API 密钥分发、模型编排、多协议接入。
 
-| 层 | 项目 | 说明 |
-|---|---|---|
-| 根项目 | [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) | 账号池调度、错误分类、提示词体系等核心设计 |
-| 直接上游 | [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) | Web 面板与可视化运维层 |
-| **本仓库** | `workbuddy2api-panel-plus` | 上游 + 三项增强 |
+账号池调度、冷却熔断、定时任务、成长任务、面板运维这些上游能力，本文档不再复述，直接看 [上游 README](https://github.com/linguo2625469/workbuddy2api-panel#readme)。
 
-账号池调度、冷却熔断、定时任务、成长任务、Web 面板等**上游内容本文档不再复述**，直接看上游 README：
-
-- 全部能力与配置细节 → [上游 README](https://github.com/linguo2625469/workbuddy2api-panel#readme)
-- 根项目设计 → [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)
-
-本仓库提交的源码 = 上游功能 + 三项增强，已合并好，`clone` 下来直接就是完整网关 + 面板，不需要先装上游、也不需要先打补丁。
+clone 下来就是完整网关 + 面板，不用先装上游、也不用打补丁。
 
 ## 使用声明（必读）
 
@@ -45,6 +36,7 @@
 我们对上述行为表达最强烈的反对，并声明如下：
 
 - **一切商用 / 售卖行为与本项目及作者无关。** 本项目不授权、不支持、不参与任何面向公众的 API 售卖、账号池出租、卡密收费分发；行为人由此产生的一切后果（包括但不限于账号封禁、条款违约与法律风险）由其自行承担，与作者和贡献者无任何关系。
+- **密钥分发功能仅限自用。** 面板里的「API 密钥」是给自己多个项目、多台机器分别配钥匙、分别限额度用的，不是拿来给别人发钥匙的。拿它对外分发、转售、共享，本项目不支持，也不提供任何与之相关的能力；由此产生的额度消耗、接口限流、账号封禁等后果一律自负。
 - **批量注册与转售接口配额违反目标平台服务条款。** CodeBuddy / 腾讯系服务条款禁止批量注册账号及商业转售接口。上游仓库已删除、停止公开维护——我们无法断定具体原因，但此类滥用行为正在毁掉所有正常使用者的环境，请勿再消耗社区的善意。
 - **请勿购买任何「收费版」「卡密版」「公益中转版」。** 本项目永远免费开源。任何加壳、加密、捆绑收费的「版本」都是他人篡改的产物，与本项目无关；且此类分发无法审计，存在被植入后门、回传并窃取你 CodeBuddy 凭证的风险（`auths/` 中保存的是明文 accessToken / refreshToken）。你付钱买到的不是本项目，而是把自己账号交给陌生人的机会。
 - **关于开源协议的诚实说明。** 本项目基于 MIT 协议开源，协议允许自由使用与修改源码——这是开源的本意，我们不会收回；但 MIT 赋予的是代码层面的自由，不赋予以本项目名义宣传、售卖、捆绑分发，或要求作者提供支持与背书的权利。作者不为任何第三方分发版本提供支持、更新承诺或安全保证。
@@ -54,97 +46,95 @@
 
 ---
 
-## 🚀 快速开始（预构建镜像，开箱即用）
+## 🚀 安装（Docker Compose）
 
 ```bash
-# 1. 取文件
-git clone https://github.com/JACKY199503/workbuddy2api-panel-plus.git && cd workbuddy2api-panel-plus
+# 1. 克隆
+git clone https://github.com/JACKY199503/workbuddy2api-panel-plus.git
+cd workbuddy2api-panel-plus
 
-# 2. 建挂载目录 + 初始配置（缺 config/config.json 容器起不来）
-mkdir -p config auths data
-cp config.example.json config/config.json
+# 2. 准备配置（缺这个文件容器起不来）
+mkdir -p config auths data && cp config.example.json config/config.json
 
-# 3. 属主对齐：容器以 uid 10001 运行，属主不对会 permission denied
+# 3. 容器以 uid 10001 运行，挂载目录属主不对会 permission denied
 sudo chown -R 10001:10001 config auths data
 
-# 4. 起
+# 4. 启动
 docker compose up -d
-
-# 5. 浏览器打开 http://<你的机器IP>:7863/ → 面板「添加账号」走 OAuth 登录
 ```
 
-- 镜像：`ghcr.io/jacky199503/workbuddy2api-panel-plus:latest`（linux/amd64，push 到 main 自动构建）
-- 自己编译：注释掉 `docker-compose.yml` 里的 `image:`、放开 `build: .`，或 `docker build -t wb2api .`
-- 升级：`docker compose pull && docker compose up -d`（`config/`、`auths/`、`data/` 是挂载目录，不会丢）
-- 健康检查：`curl -s http://localhost:7863/healthz`
+打开 `http://<你的机器IP>:7863/panel/`，用面板「添加账号」走 OAuth 登录。
+
+常用命令：
+
+```bash
+docker compose logs -f       # 跟踪日志
+docker compose restart       # 重启
+docker compose down          # 停止并移除容器（数据在 ./auths 与 ./data，不受影响）
+curl -s http://localhost:7863/healthz   # 健康检查，无可用账号时返回 503
+```
 
 ---
 
 ## 🆕 新增一：API 密钥分发（子钥匙）
 
-**解决什么问题**：原来全站只有一把管理员钥匙 —— 要么不给人用，要么给人用就等于把全部权限交出去。现在可以按需签发子钥匙，每把自带额度和边界，随时停用、随时改额度。
+**解决什么**：原来全站只有一把管理员钥匙，要么不给人用，要么给人就等于把全部权限交出去。现在可以按用途签发子钥匙，每把自带额度和边界，随时停用、随时改额度。
 
-**在哪操作**：面板左侧 **API 密钥** 页 → 右上角「新建密钥」。列表里每一行都能直接停用、改额度、看用量。
+**在哪操作**：面板左侧 **API 密钥** 页 →「新建密钥」。列表里每行都能直接停用、改额度、看用量。
 
-**一把钥匙能限制什么**（都在新建窗口里填，填 0 或留空 = 不限制）
+新建窗口里能限制的项（填 0 或留空 = 不限制）：
 
-| 窗口里的项 | 作用 |
+| 项 | 作用 |
 |---|---|
-| 密钥名称 | 用来区分用途，必填 |
-| 版本归属 | 限定这把钥匙只能走国内版或国际版，默认不限 |
-| 有效期（天） | 到期自动失效，填 0 = 长期有效 |
-| 最大来源 IP 数 | 限制最多允许几个不同 IP 用过这把钥匙 |
+| 密钥名称 | 区分用途，必填 |
+| 版本归属 | 限定只能走国内版或国际版，默认不限 |
+| 有效期（天） | 到期自动失效，0 = 长期有效 |
+| 最大来源 IP 数 | 最多允许几个不同 IP 用过这把钥匙 |
 | Token 用量上限 | 用超了就拒绝 |
 | 积分用量上限 | 用超了就拒绝 |
-| 来源 IP 白名单 | 只允许名单内的 IP 调用，支持网段写法 |
-| 模型白名单 | 只允许调用名单内的模型（含虚拟模型 `auto`），留空 = 全部放行 |
+| 来源 IP 白名单 | 只允许名单内 IP 调用，支持网段写法 |
+| 模型白名单 | 只允许调用名单内模型（含 `auto`），留空 = 全部放行 |
 
-钥匙明文以 `wbk_` 开头，**只在创建弹窗里显示这一次**，关掉就找不回来了 —— 服务端只存它的摘要，不存明文，谁也捞不出来。
+钥匙明文以 `wbk_` 开头，**只在创建弹窗里显示这一次**，关掉就找不回来了 —— 服务端只存摘要、不存明文。
 
-带 `wbk_` 前缀的钥匙走这套判定，其余的仍按原来的管理员钥匙校验。**一把子钥匙都不建的话，跟以前完全一样**。
+一把子钥匙都不建的话，跟以前完全一样。
 
 ---
 
 <a id="model-orchestration"></a>
 
-## 🆕 新增二：模型编排（auto · 免费额度薅满 · 昼夜自动切换）
+## 🆕 新增二：模型编排（按时间自动换模型）
 
-**一句话目的**：把每天能白嫖的额度尽量用满；免费窗口过期、额度波动、被限流时**自动**换模型，全程不用手动改配置。
+请求里模型名传 `auto`，网关按当前时间自动挑模型；首选被限流、积分耗尽或报错，就顺着降级链往下换。目的就一个：把每天能免费用的额度吃满，出问题不用手动改配置。
 
-**怎么触发**：得先在面板「配置」页 →「模型编排」那里打开「启用模型编排」开关并点「保存配置」，然后请求里模型名传下面这几种，网关才会接管：
+**先开启**：面板「配置」页 →「模型编排」→ 打开「启用模型编排」→ 保存配置。
+
+请求里模型名怎么传：
 
 | 你传的模型名 | 结果 |
 |---|---|
-| `auto` | 交给编排：按当前钟点在「白天主模型」和「夜间主模型」之间挑，降级链不挑版本 |
-| `cn:auto` | 交给编排，但降级链只保留国内版模型 |
-| `global:auto` | **默认配置下不生效** —— 面板里填的主模型和降级链全是国内版，没有国际版候选，这个名字会原样发给上游（基本上是 404）。想让国际版也编排，先往「降级链」里加国际版模型 |
+| `auto` | 按当前时间选白天主模型或夜间主模型 |
+| `cn:auto` | 同上，但只在国内版模型里挑 |
+| `global:auto` | 默认不生效 —— 默认配置里没有国际版候选。想让国际版也编排，先往降级链里加国际版模型 |
 | `cn:hy3`、`cn:deepseek-v4.1-flash` 这类具体名字 | 就是那个模型，原样透传，不参与编排 |
 
-上面几行提到的「白天主模型」「夜间主模型」「降级链」，就是面板「配置」页 →「模型编排」里那几个输入框，改完点「保存配置」立刻生效，不用重启。
+### 切换逻辑
 
-三个接口都认这几种写法。模型列表里能查到的虚拟名是 `auto` 和 `cn:auto` 两个。
-
-- **按钟点自动换主模型**：白天吃白天的免费额度，夜里吃夜里的免费窗口，到点自动切回。
-- **出问题自动往下顶**：首选模型被限流 / 积分耗尽 / 上游报错 / 返回空正文，就按降级链往下挑下一个能用的。
-- **优惠到期不用管**：链是按「免费 → 低倍率 → 兜底」排的，免费额度没了自然落到下一个，配置一行不用动。
-
-### 自动切换逻辑
-
-下面是面板里的默认配置，每一项都能在「配置」页 →「模型编排」里改：白天主模型、夜间主模型、白天窗口（起 / 止 小时，按北京时间）、降级链（逗号分隔，按顺序尝试）。
+按北京时间，每次请求进来时按当前钟点判定 —— **不是定时任务**，到点自然切换，不用重启、不用改配置。
 
 | 时段 | 首选模型 | 首选不行就依次往下试 |
 |---|---|---|
 | **白天 08:00–23:00** | `cn:hy3`（免费） | `cn:deepseek-v4.1-flash`（0.03x）→ `cn:glm-5.3-flash`（0.06x，1M 上下文、能看图）→ `cn:hy3-x`（0.05x，兜底） |
-| **夜间 23:00–08:00** | `cn:hy4-preview`（夜间老用户免费窗口） | `cn:hy3` → `cn:deepseek-v4.1-flash` → `cn:glm-5.3-flash` → `cn:hy3-x` |
+| **夜间 23:00–08:00** | `cn:hy4-preview`（夜间免费窗口） | `cn:hy3` → `cn:deepseek-v4.1-flash` → `cn:glm-5.3-flash` → `cn:hy3-x` |
 
-- 切换**不是定时任务**：每次请求进来按当前钟点判定，08:00 一到请求自然回到 `cn:hy3`，无需重启、无需改配置。
-- 白天主模型 `cn:hy3` 本身也在降级链里 —— 夜里 `cn:hy4-preview` 挂掉时接上的就是它；白天它已经是首选，链里重复的那一项会被**自动跳过**。所以一条降级链同时服务昼夜两个时段。
-- 链尾 `cn:hy3-x` 是兜底位：只要账号还有额度就一定有响应，不会把请求打空。
+上面这几个值（白天主模型、夜间主模型、白天窗口起止、降级链）都在面板「配置」页 →「模型编排」里改，保存后立即生效。
 
-### 具体模型名也能挂降级链
+- 免费额度用完不用管：链是按「免费 → 低倍率 → 兜底」排的，自然落到下一个。
+- 链尾 `cn:hy3-x` 是兜底位，账号还有额度就一定有响应，不会把请求打空。
 
-传具体模型名（比如 `cn:deepseek-v4.1-flash`）就是它自己，跟 `auto` 没关系，不受编排影响。
-但可以在面板「配置」页 →「模型编排」的「具名模型降级表」里给它单独配一条链 —— 它挂了就往下顶：
+### 给具体模型单独配降级
+
+传具体模型名默认是原样透传、没有降级。可以在面板「模型编排」的降级表里给它单独配一条链：
 
 ```json
 "model_fallback": {
@@ -153,69 +143,51 @@ docker compose up -d
 }
 ```
 
-左边写模型名，必须跟请求里传的一字不差；右边写它挂了之后要顶上的候选。两条链叠加展开，自动去重，最多 8 个、递归 3 层。
-没写进这张表的模型名，就是原样透传，没有降级。
+左边写模型名，必须跟请求里传的一字不差；右边写它挂了之后要顶上的候选。自动去重，最多 8 个、递归 3 层。没写进这张表的模型，就是原样透传。
 
 ---
 
 <a id="protocol-compat"></a>
 
-## 🆕 新增三：多协议接入（Claude Code / Codex 等客户端直接连）
+## 🆕 新增三：多协议接入（Claude Code / Codex 直接连）
 
-**解决什么问题**：原来网关只认 OpenAI 那一个聊天接口地址。Claude Code 这类客户端走的是 Anthropic 那套（`/v1/messages`），新版 OpenAI SDK 和 Codex 走的是 Responses 那套（`/v1/responses`），照原来的网关接上来直接就是 404。现在两种都能直接打进来，共用同一套账号池、子钥匙和模型编排。
+原来网关只认 OpenAI 那一个聊天接口，Claude Code 走的是 `/v1/messages`、新版 OpenAI SDK 和 Codex 走的是 `/v1/responses`，接上来直接 404。现在三种都能打进来，共用同一套账号池、子钥匙和模型编排。
 
-| 接口地址 | 谁在用 | 说明 |
-|---|---|---|
-| `POST /v1/chat/completions` | 绝大多数 OpenAI 兼容客户端 | 一直在用的那个，行为没动过 |
-| `POST /v1/responses` | 新版 OpenAI SDK / Codex | 提问内容写一句话或者一段多轮对话都行，另有系统提示词和最大输出长度，返回值按 Responses 规范给 |
-| `POST /v1/messages` | Claude Code 等 Anthropic 系客户端 | 多轮对话 + 系统提示 + 最大输出长度，返回值按 Messages 规范给 |
+| 接口 | 谁在用 |
+|---|---|
+| `POST /v1/chat/completions` | 绝大多数 OpenAI 兼容客户端（一直在用的那个，行为没动） |
+| `POST /v1/responses` | 新版 OpenAI SDK / Codex |
+| `POST /v1/messages` | Claude Code 等 Anthropic 系客户端 |
 
-**怎么做的**：请求进来后先翻成内部聊天接口能看懂的样子，然后走同一条完整链路（挑账号 / 换号 / 冷却 / 编排降级 / 钥匙校验 / 记用量），最后把回答翻回对应协议的格式 —— 非流式一次性转写，流式按各协议的标准一段一段往外推。调度逻辑只有一份，两个新接口没有另起炉灶。
-
-- **鉴权**：沿用原来的管理员钥匙和 `wbk_` 子钥匙；出错时按**你这个请求进的是哪个口**来返回错误格式，客户端不用额外适配。
-- **计费**：跟聊天接口完全一致，同一份用量统计、同一套额度扣减。
-- **模型编排**：传 `auto` / `cn:auto` 在三个接口上都生效，降级和昼夜切换照常；实际用了哪个模型，响应头里会带出来。
-- **用不上的参数直接忽略**，不报错。
-
-**怎么用**
+- **鉴权**：沿用管理员钥匙和 `wbk_` 子钥匙；报错按你进的是哪个口返回对应格式，客户端不用额外适配
+- **计费**：跟聊天接口完全一致，同一份用量统计、同一套额度扣减
+- **模型编排**：`auto` / `cn:auto` 三个接口都生效，实际用了哪个模型在响应头里带出来
+- **用不上的参数直接忽略**，不报错
 
 ```bash
-# 新版 OpenAI SDK / Codex 走这个
+# 新版 OpenAI SDK / Codex
 curl http://HOST:7863/v1/responses \
   -H "Authorization: Bearer <你的key>" -H "Content-Type: application/json" \
   -d '{"model":"auto","input":"用一句话介绍自己"}'
 
-# Claude Code 等 Anthropic 系客户端走这个
+# Claude Code 等 Anthropic 系客户端
 curl http://HOST:7863/v1/messages \
   -H "Authorization: Bearer <你的key>" \
   -H "Content-Type: application/json" -H "anthropic-version: 2023-06-01" \
   -d '{"model":"auto","max_tokens":1024,"messages":[{"role":"user","content":"用一句话介绍自己"}]}'
 ```
 
-Claude Code 把环境变量 `ANTHROPIC_BASE_URL` 填成网关地址就行（例如 `http://HOST:7863`），钥匙用子钥匙或管理员钥匙都可以，别的不用改。
+Claude Code 把环境变量 `ANTHROPIC_BASE_URL` 填成网关地址就行（例如 `http://HOST:7863`），钥匙用子钥匙或管理员钥匙都可以。
 
 ---
 
-## 上游已有能力（不在本文档展开）
-
-以下能力全部来自上游，未做删改，用法见对应文档：
-
-| 能力 | 去哪看 |
-|---|---|
-| 账号池调度、冷却熔断、选号策略、会话粘性 | [上游 README · 核心行为语义](https://github.com/linguo2625469/workbuddy2api-panel#readme) |
-| 定时任务（签到 / 活跃 / 旅行 / 保活 / 夜猫子） | [上游 README · 定时任务](https://github.com/linguo2625469/workbuddy2api-panel#readme) |
-| 成长任务一键完成、连登管家、开学季活动 | [上游 README · 成长任务](https://github.com/linguo2625469/workbuddy2api-panel#readme) |
-| Web 管理面板（账号池 / 模型档位 / 在线改配置 / 日志） | [上游 README · Web 管理面板](https://github.com/linguo2625469/workbuddy2api-panel#readme) |
-| 完整配置项速查、环境变量覆盖、API 端点、错误分类 | [上游 README · 配置说明](https://github.com/linguo2625469/workbuddy2api-panel#readme) |
-
 ## License
 
-[MIT](LICENSE)。再分发请保留原仓库 MIT 声明，注明原始出处 `https://github.com/Sliverkiss/workbuddy2api`。本项目不授予任何上游（CodeBuddy / 腾讯）接口或服务的权利。
+[MIT](LICENSE)。再分发请保留 MIT 声明。本项目不授予任何上游（CodeBuddy / 腾讯）接口或服务的权利。
 
 ## 🙏 致谢
 
-- 根项目：[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)
-- 直接上游：[linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)
+- 上游：[linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)
 - 本仓库二改（2026-09）：**API 密钥分发**、**模型编排** 与 **多协议接入**，新增代码：
 
 | 新增文件 | 作用 |
