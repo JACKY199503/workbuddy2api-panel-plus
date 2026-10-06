@@ -42,6 +42,9 @@ type Config struct {
 	RedisMode string               // "upstash" / "noop"，仅观测透出
 	Version   string               // 面板版本号（展示用）
 
+	// Keys 对外分发的子密钥库（可选；nil = 密钥页返回 501）。
+	Keys *apikeys.Store
+
 	// Live 运行期可变配置（在线改配置立即生效）。
 	Live *livecfg.Holder
 
@@ -66,9 +69,6 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
-
-	// Keys 对外分发的子密钥库（可选；nil = 密钥页返回 501）。
-	Keys *apikeys.Store
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -164,6 +164,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.accountPause))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.withAuth(p.accountResume))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
@@ -192,7 +194,6 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/keys/{id}", p.withAuth(p.keysPatch))
 	p.mux.HandleFunc("DELETE /panel/api/keys/{id}", p.withAuth(p.keysDelete))
 	p.mux.HandleFunc("POST /panel/api/keys/{id}/reset", p.withAuth(p.keysReset))
-	p.mux.HandleFunc("POST /panel/api/keys/check-models", p.withAuth(p.keysCheckModels))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 }
@@ -474,7 +475,6 @@ func (p *Panel) accountRevive(w http.ResponseWriter, r *http.Request) {
 }
 
 // accountDisable 人工禁用（不再参与选号，需面板 revive 或重登恢复）。
-//
 // 原因文案用中文（与页面其余状态文案一致），并在禁用前把账号当时的冷却原因并进去：
 // Disable 会清冷却域（until/reason 一并归零），一个因「余额不足」硬冷却到次日 04:00 的
 // 号被人工停用后，原本的死因会被抹掉，运维只剩一句「手动停用」看不出它其实也缺积分。
@@ -493,6 +493,30 @@ func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 	p.cfg.Pool.Disable(uid, reason)
 	log.Printf("panel: disable uid=%s（人工禁用，原因=%s）", uid, reason)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "reason": reason})
+}
+
+// accountPause 暂停选号：账号退出选号候选，但**照常参与**签到 / 活跃上报 / 保活 /
+// 余额刷新。与 disable 的区别：不写 reason、不清冷却域、不重置计数——账号是「临时
+// 让位」而非「判死」，点「恢复选号」即可立刻回到池子（无需重登或解冻）。
+func (p *Panel) accountPause(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if !p.cfg.Pool.Pause(uid) {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	log.Printf("panel: pause uid=%s（暂停选号，保号任务照常）", uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// accountResume 解除暂停选号（幂等，对未暂停账号为空操作）。
+func (p *Panel) accountResume(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if !p.cfg.Pool.Resume(uid) {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	log.Printf("panel: resume uid=%s（恢复参与选号）", uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），

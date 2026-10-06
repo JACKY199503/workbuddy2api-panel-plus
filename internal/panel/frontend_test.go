@@ -645,3 +645,64 @@ process.stdout.write(JSON.stringify({
 		t.Fatalf("expiry summary=%s want %s", out, want)
 	}
 }
+
+// TestAppJSCollectConfigClearable 钉住 collectConfig 的空串语义。
+//
+// 覆盖型字段（user_agent / prompt_file）空串必须照发：漏发会让面板显示"已保存"
+// 而 config.json 里的值没变（issue #102 附带发现 2）。
+//
+// 同时钉住反面：其余文本字段空串仍然不下发。这条同样重要——若哪天为了修上面那个
+// 问题改成"所有空串都发"，表单里任何一个没填的框都会变成"请清空"，静默抹掉配置。
+func TestAppJSCollectConfigClearable(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; collectConfig test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const CFG_MAP');
+const end = src.indexOf('/* Go 时长字段即时校验');
+if (start < 0 || end < 0 || end < start) throw new Error('collectConfig region not found');
+const mk = v => ({ type: 'text', value: v });
+const cfgForm = { elements: {
+  listen: mk(''),
+  api_key: mk('secret'),
+  user_agent: mk(''),
+  prompt_file: mk(''),
+  checkin_hours: mk(''),
+}};
+const ctx = {
+  Date, Number, String, Math, Map, Array, Object, isNaN, URLSearchParams, Set,
+  document: { getElementById: id => (id === 'cfgForm' ? cfgForm : null) },
+  $: id => (id === 'cfgForm' ? cfgForm : null),
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.collectConfig = collectConfig;', ctx);
+const out = ctx.collectConfig();
+const has = (o, k) => Object.prototype.hasOwnProperty.call(o || {}, k);
+process.stdout.write(JSON.stringify([
+  has(out.upstream, 'user_agent'), (out.upstream || {}).user_agent,
+  has(out.prompt, 'file'), (out.prompt || {}).file,
+  has(out, 'listen'),
+  has(out.schedule, 'checkin_hours'),
+  out.api_key
+]));`
+	f, err := os.CreateTemp(t.TempDir(), "cfgc-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("collectConfig node test failed: %v\n%s", err, out)
+	}
+	// [user_agent 已发, 其值, prompt.file 已发, 其值, listen 未发, checkin_hours 未发, api_key]
+	const want = `[true,"",true,"",false,false,"secret"]`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("collectConfig=%s want %s", strings.TrimSpace(string(out)), want)
+	}
+}
