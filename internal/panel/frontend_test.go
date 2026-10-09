@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -500,6 +501,7 @@ process.stdout.write(JSON.stringify({
   rolling24: q('24', true),
   rolling72: q('72', true),
   rolling0: q('0', true),
+  log0: q('0', false),
   log24From: approx(q('24', false), Math.floor((now - 24 * 3600e3) / 1000)),
   log24HasHours: /hours=/.test(q('24', false)),
   log7dFrom: approx(q('168', false), Math.floor((now - 168 * 3600e3) / 1000)),
@@ -529,12 +531,76 @@ process.stdout.write(JSON.stringify({
 		return strconv.FormatInt(time.Date(2026, 9, 30, h, m, 0, 0, time.Local).Unix(), 10)
 	}
 	want := `{"todayIsMidnight":true,"todayNoTo":true,` +
-		`"rolling24":"hours=24","rolling72":"hours=72","rolling0":"",` +
+		// rolling0 必须是 "hours=0"（显式全部历史）。此前期望值是空串——那恰好把
+		// issue #121 的错误行为固化成了断言：空 query 会被后端的 72 小时缺省接管，
+		// 于是「全部历史」显示成「近 3 天」。
+		// log0 仍为空：请求记录端点没有缺省窗口，不传 from/to 就是全部历史。
+		`"rolling24":"hours=24","rolling72":"hours=72","rolling0":"hours=0","log0":"",` +
 		`"log24From":true,"log24HasHours":false,"log7dFrom":true,` +
 		`"custom":"from=` + local(9, 0) + `&to=` + local(18, 30) + `",` +
 		`"labelCustom":"9-30 09:00 → 9-30 18:30","labelToday":"今天"}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("time range=%s\nwant %s", out, want)
+	}
+}
+
+// 配置表单与 CFG_MAP 必须一一对应，且面板声称"可在线改"的热生效键必须真的
+// 出现在表单里。
+//
+// 为什么需要：`logging.request_client_info` 曾经在表单里存在过，后来在某次改动中
+// 被连带删掉，而 Go 侧的配置键、livecfg 热生效通路、README 的描述都还在——面板
+// 少了一个开关而 Go 测试全绿，只有人肉点开配置页才会发现。这里把"表单字段 ↔
+// CFG_MAP"与"关键热改键必须在表单里"两条都钉住。
+func TestConfigFormMatchesCFGMap(t *testing.T) {
+	src, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(src)
+	htmlBytes, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(htmlBytes)
+
+	// CFG_MAP 块（下面两条检查共用）。
+	mapBlock := js[strings.Index(js, "const CFG_MAP = {"):]
+	mapBlock = mapBlock[:strings.Index(mapBlock, "\n};")]
+	// 不能按行首匹配：CFG_MAP 里多个键写在同一行（`a: [...], b: [...]`），只有行首
+	// 那个带换行缩进。按「前面是行首或分隔符」判定才不漏。
+	inMap := func(name string) bool {
+		return regexp.MustCompile(`(?:^|[\s,{])` + regexp.QuoteMeta(name) + `:\s*\[`).MatchString(mapBlock)
+	}
+
+	// 1) 表单里的每个 name 都要有 CFG_MAP 条目（否则收集/回填都拿不到它）。
+	form := html[strings.Index(html, `<form id="cfgForm">`):]
+	form = form[:strings.Index(form, "</form>")]
+	names := map[string]bool{}
+	for _, m := range regexp.MustCompile(`name="([a-z_0-9]+)"`).FindAllStringSubmatch(form, -1) {
+		names[m[1]] = true
+	}
+	if len(names) == 0 {
+		t.Fatal("未从配置表单解析出任何 name 字段")
+	}
+	for n := range names {
+		if !inMap(n) {
+			t.Errorf("表单字段 %q 在 CFG_MAP 里没有条目（保存时会被静默丢弃）", n)
+		}
+	}
+
+	// 2) CFG_MAP 里的每个键都要在表单里有控件（否则回填/保存是空转）。
+	for _, m := range regexp.MustCompile(`(?:^|[\s,{])([a-z_0-9]+):\s*\[`).FindAllStringSubmatch(mapBlock, -1) {
+		if !names[m[1]] {
+			t.Errorf("CFG_MAP 键 %q 在配置表单里没有对应控件", m[1])
+		}
+	}
+
+	// 3) 明确断言这一个键：后端有配置项、README 说面板可改，UI 不能少。
+	if !strings.Contains(js, "request_client_info: ['logging', 'request_client_info']") {
+		t.Error("CFG_MAP 缺 request_client_info 条目")
+	}
+	if !names["request_client_info"] {
+		t.Error("配置表单缺「记录调用来源」开关（logging.request_client_info）")
 	}
 }
 
@@ -704,5 +770,136 @@ process.stdout.write(JSON.stringify([
 	const want = `[true,"",true,"",false,false,"secret"]`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("collectConfig=%s want %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestAppJSExpirySortedByExpiry 到期提醒按「最近到期」升序，且不分域（issue #125）。
+//
+// 后端 /panel/api/packages 是按**余额降序**返回的，恰好把 CN 账号都排在前面、
+// global 排在末尾，看上去像"按域分组"，实际只是余额顺序。本用例刻意按这个形态构造
+// 输入（余额高的到期最晚、global 余额最低），若前端不重排就会保持该顺序而失败。
+//
+// 日期按「今天 +N 天」生成而不是写死：写死的话过了那天用例就会自己失效。
+func TestAppJSExpirySortedByExpiry(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; expiry sort test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function expBatches');
+const end = src.indexOf('async function loadExpiry');
+if (start < 0 || end < 0 || end < start) throw new Error('expiry region not found');
+const sink = { innerHTML: '', textContent: '', hidden: true };
+const ctx = {
+  esc: s => String(s == null ? '' : s),
+  fmtTok: v => String(v == null ? 0 : v),
+  $: () => sink,
+  Date, Math, Number, String, Map, Array, Object, isNaN,
+  lastPackages: null, lastPackagesAt: 0,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderExpiry = renderExpiry;', ctx);
+const iso = n => {
+  const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() + n);
+  const p = x => String(x).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+};
+const pack = (days, amount) => ({ end_time: iso(days) + ' 00:00:00', remain: amount });
+// 模拟后端顺序：余额降序 → CN 高余额在前且到期最晚，global 最少且最快到期。
+const d = { accounts: [
+  { uid: 'a', nickname: 'cn-late',  realm: 'cn',     packages: [pack(16, 900)] },
+  { uid: 'b', nickname: 'cn-mid',   realm: 'cn',     packages: [pack(12, 700)] },
+  { uid: 'c', nickname: 'gl-soon',  realm: 'global', packages: [pack(2, 500)] },
+  { uid: 'd', nickname: 'no-expiry', realm: 'cn',    packages: [pack(-3, 100)] },
+  { uid: 'e', nickname: 'broken',   realm: 'cn',     error: 'offline' },
+] };
+ctx.renderExpiry(d);
+const names = [...sink.innerHTML.matchAll(/<span class="exp-nm">([^<]*)<\/span>/g)].map(m => m[1]);
+process.stdout.write(JSON.stringify(names));`
+	f, err := os.CreateTemp(t.TempDir(), "expsort-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("expiry sort node test failed: %v\n%s", err, out)
+	}
+	// 最快到期的排最前（跨域）；无 7 天内到期的与查询失败的排最后。
+	const want = `["gl-soon","cn-mid","cn-late","no-expiry","broken"]`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("expiry order=%s\nwant %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestAppJSChartTooltipInsideBar 图表 tooltip 必须挂在每根柱子内部（issue #128）。
+//
+// <title> 在 SVG 里描述的是**父元素**。此前它被平铺在 <svg> 根下（<rect> 是自闭合的，
+// 无法包含子节点），于是整张图共用一个 tooltip —— 浏览器取第一个 —— 悬停任何柱子都
+// 显示同一份数据。这类问题不报错、不影响渲染，只靠肉眼看很容易漏。
+//
+// 断言结构：<g> 数量 == 数据点数，且每个 <g> 紧跟一个 <title>；同时确认没有
+// 游离在 <g> 之外的 <title>。
+func TestAppJSChartTooltipInsideBar(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; chart tooltip test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function parsePointTime');
+const chartStart = src.indexOf('function renderUsageChart');
+if (start < 0 || chartStart < 0) throw new Error('chart functions not found');
+let end = src.indexOf('\nfunction ', chartStart + 10);
+if (end < 0) end = src.length;
+const sinks = {};
+const mk = id => (sinks[id] = { innerHTML: '', textContent: '' });
+const ctx = {
+  esc: s => String(s == null ? '' : s),
+  fmtTok: v => String(v == null ? 0 : v),
+  $: id => (sinks[id] || mk(id)),
+  Date, Math, Number, String, Map, Array, Object, isNaN, Infinity, isFinite, Set,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderUsageChart = renderUsageChart;', ctx);
+const series = [];
+for (let h = 0; h < 5; h++) {
+  const d = new Date(); d.setHours(d.getHours() - (4 - h), 0, 0, 0);
+  const iso = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' +
+              String(d.getDate()).padStart(2, '0') + 'T' + String(d.getHours()).padStart(2, '0');
+  series.push({ t: iso, scope: 'hour', prompt_tokens: (h + 1) * 100,
+                completion_tokens: (h + 1) * 10, total_tokens: (h + 1) * 110, requests: h + 1 });
+}
+ctx.renderUsageChart(series);
+const svg = sinks['usChart'] ? sinks['usChart'].innerHTML : '';
+const groups = svg.match(/<g><title>/g) || [];
+const titles = svg.match(/<title>[^<]*<\/title>/g) || [];
+// 游离的 <title>：前面不是 <g>（即仍平铺在根下）
+const loose = (svg.match(/(?:<rect[^>]*\/>|<\/g>)<title>/g) || []).length;
+process.stdout.write(JSON.stringify({
+  points: series.length, groups: groups.length, titles: titles.length, loose: loose,
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "charttip-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("chart tooltip node test failed: %v\n%s", err, out)
+	}
+	const want = `{"points":5,"groups":5,"titles":5,"loose":0}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("chart tooltip structure=%s\nwant %s（groups 应等于数据点数，loose 应为 0）",
+			strings.TrimSpace(string(out)), want)
 	}
 }

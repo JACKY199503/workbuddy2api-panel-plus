@@ -180,7 +180,7 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 
 /* ── 统计条（观测区）──────────────────────────────────────────────── */
 .stats {
-  display: grid; grid-template-columns: repeat(6, 1fr);
+  display: grid; grid-template-columns: repeat(7, 1fr);
   border: 1px solid var(--line); border-radius: 11px; background: var(--surface);
   overflow: hidden; margin-bottom: 20px; box-shadow: var(--shadow);
 }
@@ -647,6 +647,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat good"><div class="v" id="sHealthy">-</div><div class="k">可用</div></div>
         <div class="stat warn"><div class="v" id="sCooling">-</div><div class="k">冷却中</div></div>
         <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
+        <div class="stat warn"><div class="v" id="sPaused">-</div><div class="k">已暂停选号</div></div>
         <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
       </div>
@@ -679,6 +680,23 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
+        </table>
+        </div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>模型锁池 <span class="hint">哪些模型不能用、还要锁多久</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="mlNote"></span>
+        </header>
+        <div class="tbl-wrap">
+        <table class="acc">
+          <thead><tr>
+            <th>模型</th><th>域</th><th>状态</th><th>可选 / 总数</th>
+            <th>锁定账号</th><th>最早解锁</th><th>全池解锁</th><th>原因</th>
+          </tr></thead>
+          <tbody id="mlBody"></tbody>
         </table>
         </div>
       </div>

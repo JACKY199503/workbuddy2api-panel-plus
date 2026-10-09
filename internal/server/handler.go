@@ -287,6 +287,10 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		},
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
+		// model_locks 当前有未过期模型级限流的 (域, 模型) 全清单：账号池视图回答
+		// 「哪些号不能用」，本键回答「哪些模型不能用、锁了几个号、还要锁多久」。
+		// 与 ModelBlocked（请求失败时的单模型判定）互补；无锁时为 null。零回归只增键。
+		"model_locks": h.cfg.Pool.ModelLockView(),
 		// credit_floor 生效的积分保底值（0 = 关闭）。与 accounts[].credits +
 		// model_costs 对照即可判定「某号为何对某模型不出票」。零值也显式写出
 		// （运维口径：缺失会让人误以为没记录）。
@@ -1448,6 +1452,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 // 同理，ttfb 不小于总耗时时（时钟粒度、或 TTFB 落在计时终点之后）退回端到端耗时，
 // 避免零/负分母。token 数为负哨兵值（-1 = 观测缺失）时返回 false。
 //
+// 扣除后不足 minGenWindow 也退回端到端（issue #127）：ttfb 量的是「首个 SSE 帧
+// 到达」，当上游把整个响应攒到最后一次性下发（假流式/中间层攒批刷新——首帧与
+// 末帧几乎同时到）时，total−ttfb 只剩几毫秒，拿它当分母会把几百 token 除成
+// 上万 tok/s 的幻数。这种形态下「生成时长」根本不可测，诚实的分母只有端到端。
+//
 // 用量账本（handler）与控制台流水行（logging.go）都走这一个函数：两处各算一遍时
 // 口径漂移过一次（流水行漏扣 TTFB、与面板数字对不上），共用是防再次分叉的唯一办法。
 func tokensPerSecond(completionTokens int64, total, ttfb time.Duration) (float64, bool) {
@@ -1456,12 +1465,18 @@ func tokensPerSecond(completionTokens int64, total, ttfb time.Duration) (float64
 	}
 	gen := total
 	if ttfb > 0 {
-		if g := total - ttfb; g > 0 {
+		if g := total - ttfb; g >= minGenWindow {
 			gen = g
 		}
 	}
 	return float64(completionTokens) / gen.Seconds(), true
 }
+
+// minGenWindow 可信生成窗口的下限：扣除 TTFB 后剩余窗口不足该值即视为「生成
+// 时长不可测」，退回端到端耗时（见 tokensPerSecond 注释，issue #127）。
+// 真流式下首帧到末帧通常铺满剩余窗口，200ms 远低于正常生成时长，不影响真实
+// 快速输出（如缓存命中后的爆发）被如实报告。
+const minGenWindow = 200 * time.Millisecond
 
 // promptTooLongMessage 11115 透传 message：上游 body 原文（含真实 token 数/
 // 上限值/requestId，客户端自行排查）；空 body 兜底为可读分类短文案（不编造原文）。
