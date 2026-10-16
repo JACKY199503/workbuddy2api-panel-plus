@@ -48,6 +48,7 @@ func messagesToChat(raw []byte) (chat []byte, stream bool, model, errMsg string)
 		MaxTokens     *int              `json:"max_tokens"`
 		Temperature   *float64          `json:"temperature"`
 		TopP          *float64          `json:"top_p"`
+		TopK          *int              `json:"top_k"`
 		StopSequences []string          `json:"stop_sequences"`
 		Stream        bool              `json:"stream"`
 		Tools         []json.RawMessage `json:"tools"`
@@ -117,6 +118,11 @@ func messagesToChat(raw []byte) (chat []byte, stream bool, model, errMsg string)
 	if req.TopP != nil {
 		out["top_p"] = *req.TopP
 	}
+	// top_k 是 Anthropic 独有字段（OpenAI 规范没有）：上游实测忽略未知字段（200），
+	// 透传不产生 400；不支持的模型自然无效果，好过静默丢弃参数。
+	if req.TopK != nil {
+		out["top_k"] = *req.TopK
+	}
 	if len(req.StopSequences) > 0 {
 		out["stop"] = req.StopSequences
 	}
@@ -181,8 +187,15 @@ func anthropicUserBlocks(blocks []map[string]any) ([]any, bool) {
 			if id == "" {
 				continue
 			}
+			txt := toolResultText(b["content"])
+			// is_error=true 的工具结果必须让模型看得见：OpenAI 的 role:tool 没有
+			// 对应字段，直接透传会把它当成一次正常返回，模型据此继续编造成功结果。
+			// 在正文前打标记（不删原内容）——这是唯一的无损携带方式。
+			if e, _ := b["is_error"].(bool); e {
+				txt = "[tool_error] " + txt
+			}
 			out = append(out, map[string]any{
-				"role": "tool", "tool_call_id": id, "content": toolResultText(b["content"]),
+				"role": "tool", "tool_call_id": id, "content": txt,
 			})
 		case "text":
 			if t, _ := b["text"].(string); t != "" {

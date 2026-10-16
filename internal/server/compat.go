@@ -45,6 +45,9 @@ func (h *Handler) compatRun(w http.ResponseWriter, r *http.Request, p compatProt
 	inner.URL.RawPath = ""
 	inner.Body = io.NopCloser(bytes.NewReader(chatBody))
 	inner.ContentLength = int64(len(chatBody))
+	// 翻译后的 body 恒为 JSON：入站客户端漏带 Content-Type（curl -d 直发）时
+	// 内部链路读不到，这里补齐，避免协议层差异变成 400。
+	inner.Header.Set("Content-Type", "application/json")
 
 	rec := newCompatRecorder(w, p, stream, model)
 	h.mux.ServeHTTP(rec, inner)
@@ -254,6 +257,11 @@ func (cr *compatRecorder) handleFrame(frame string) {
 	if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
 		cr.usage = u
 	}
+	// 流式下 model 取上游实际模型（编排可能换了号/换了模型）：首帧已发出改不回，
+	// 但末帧（response.completed / 后续事件）要用真值，否则客户端记录的是入站名。
+	if m, ok := obj["model"].(string); ok && m != "" {
+		cr.model = m
+	}
 }
 
 // finish 收尾：非流式翻译整体响应，错误走协议错误形态，流式补终止事件。
@@ -349,8 +357,17 @@ func (cr *compatRecorder) startStream() {
 	cr.w.WriteHeader(http.StatusOK)
 	cr.Flush()
 	if cr.proto == protoResponses {
+		// message item 固定占 output_index 0；工具块从 1 起（否则首个工具与
+		// 消息块同号，客户端按 output_index 归并时会把两者混成一个 item）。
+		cr.nextIdx = 1
 		cr.writeSSE("response.created", map[string]any{
 			"type": "response.created", "response": cr.responseObject("in_progress", ""),
+		})
+		// in_progress 是官方事件序列的固定第二帧（SDK 据此把 status 从 queued
+		// 推进到 in_progress）；缺帧不影响解析，但严格按顺序消费的客户端会卡在
+		// 「等下一帧」——成本为零，补齐。
+		cr.writeSSE("response.in_progress", map[string]any{
+			"type": "response.in_progress", "response": cr.responseObject("in_progress", ""),
 		})
 		cr.writeSSE("response.output_item.added", map[string]any{
 			"type": "response.output_item.added", "output_index": 0, "item": cr.outputItem("in_progress", ""),
@@ -551,9 +568,15 @@ func (cr *compatRecorder) emitDone() {
 	}
 	cr.closeBlocks()
 	cr.writeSSE("message_delta", map[string]any{
-		"type":  "message_delta",
-		"delta": map[string]any{"stop_reason": anthropicStopReason(cr.finishRsn), "stop_sequence": nil},
-		"usage": map[string]any{"output_tokens": cr.tokens("completion_tokens")},
+		"type": "message_delta",
+		"delta": map[string]any{
+			"stop_reason":   cr.stopReason(cr.finishRsn),
+			"stop_sequence": nil,
+		},
+		// usage 带 input_tokens：Anthropic 规范里 message_delta 只定义 output_tokens，
+		// 但本网关流式的 input_tokens 只有流末才拿得到（message_start 已发出，补不回），
+		// 这里并列给出，让按 message_delta 汇总用量的客户端不至于漏掉输入侧。
+		"usage": cr.anthropicUsage(),
 	})
 	cr.writeSSE("message_stop", map[string]any{"type": "message_stop"})
 }
@@ -628,13 +651,47 @@ func (cr *compatRecorder) writeFinal(chat map[string]any) {
 		"role":          "assistant",
 		"model":         cr.model,
 		"content":       content,
-		"stop_reason":   anthropicStopReason(finish),
+		"stop_reason":   cr.stopReason(finish),
 		"stop_sequence": nil,
-		"usage": map[string]any{
-			"input_tokens":  cr.tokens("prompt_tokens"),
-			"output_tokens": cr.tokens("completion_tokens"),
-		},
+		"usage":         cr.anthropicUsage(),
 	})
+}
+
+// anthropicUsage Anthropic 形态用量对象。除 input/output 外并列给出缓存用量：
+// 上游 chat usage 带 cache_creation_input_tokens / cache_read_input_tokens，
+// Anthropic 规范里这两个字段恒存在（缺字段会让按 usage 做成本统计的客户端拿到
+// undefined，而不是 0）。无源数据时 tokens() 回落 0，不编造。
+func (cr *compatRecorder) anthropicUsage() map[string]any {
+	return map[string]any{
+		"input_tokens":                cr.tokens("prompt_tokens"),
+		"output_tokens":               cr.tokens("completion_tokens"),
+		"cache_creation_input_tokens": cr.tokens("cache_creation_input_tokens"),
+		"cache_read_input_tokens":     cr.tokens("cache_read_input_tokens"),
+	}
+}
+
+// responsesUsage Responses 形态用量对象：input/output/total 之上补 OpenAI 规范的
+// tokens_details（缓存命中 token 与推理 token）。源数据取上游 details 子树，
+// 缺失时回落平铺字段（cached_tokens / completion_thinking_tokens）。
+func (cr *compatRecorder) responsesUsage() map[string]any {
+	cached, reasoning := 0, 0
+	if d, ok := cr.usage["prompt_tokens_details"].(map[string]any); ok {
+		cached = numOf(d["cached_tokens"])
+	} else {
+		cached = cr.tokens("cached_tokens")
+	}
+	if d, ok := cr.usage["completion_tokens_details"].(map[string]any); ok {
+		reasoning = numOf(d["reasoning_tokens"])
+	} else {
+		reasoning = cr.tokens("completion_thinking_tokens")
+	}
+	return map[string]any{
+		"input_tokens":          cr.tokens("prompt_tokens"),
+		"output_tokens":         cr.tokens("completion_tokens"),
+		"total_tokens":          cr.tokens("total_tokens"),
+		"input_tokens_details":  map[string]any{"cached_tokens": cached},
+		"output_tokens_details": map[string]any{"reasoning_tokens": reasoning},
+	}
 }
 
 // parseChatToolCalls 从 chat 响应的 message.tool_calls 解析工具调用列表。
@@ -688,14 +745,15 @@ func (cr *compatRecorder) responseObject(status, txt string) map[string]any {
 		"status":     status,
 		"model":      cr.model,
 		"output":     output,
-		"usage": map[string]any{
-			"input_tokens":  cr.tokens("prompt_tokens"),
-			"output_tokens": cr.tokens("completion_tokens"),
-			"total_tokens":  cr.tokens("total_tokens"),
-		},
+		"usage":      cr.responsesUsage(),
 	}
-	if status == "completed" {
-		out["output_text"] = txt
+	// output_text 始终给（官方在非 completed 也带该字段，只是为空）：只按 completed
+	// 给会让读 output_text 的客户端在 incomplete 时拿到 undefined 而非空串。
+	// status=incomplete（对应 finish_reason=length）补 incomplete_details：
+	// 客户端据此区分「被截断」与「正常结束」，缺字段会被当成成功完成。
+	out["output_text"] = txt
+	if status == "incomplete" {
+		out["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
 	}
 	return out
 }
@@ -765,6 +823,17 @@ func anthropicErrType(status int) string {
 	}
 }
 
+// cr.stopReason 计算本轮的 Anthropic stop_reason，并在「有工具调用」时兜底成
+// tool_use：部分上游在返回 tool_calls 时仍给 finish_reason=stop，照搬会让
+// stop_reason=end_turn —— Claude Code 等客户端据此判定「这轮已结束」直接收工
+// （issue #2 的同类病：工具调用被当成对话终止）。有工具即 tool_use，无工具按映射。
+func (cr *compatRecorder) stopReason(finish string) string {
+	if len(cr.toolCalls()) > 0 {
+		return "tool_use"
+	}
+	return anthropicStopReason(finish)
+}
+
 // anthropicStopReason OpenAI finish_reason → Anthropic stop_reason。
 func anthropicStopReason(finish string) string {
 	switch finish {
@@ -794,14 +863,19 @@ func (cr *compatRecorder) tokens(key string) int {
 	if cr.usage == nil {
 		return 0
 	}
-	switch v := cr.usage[key].(type) {
+	return numOf(cr.usage[key])
+}
+
+// numOf 把 JSON 数字（float64 / int / json.Number）取成 int，其它类型一律 0。
+func numOf(v any) int {
+	switch n := v.(type) {
 	case float64:
-		return int(v)
-	case int:
-		return v
-	case json.Number:
-		n, _ := v.Int64()
 		return int(n)
+	case int:
+		return n
+	case json.Number:
+		i, _ := n.Int64()
+		return int(i)
 	}
 	return 0
 }

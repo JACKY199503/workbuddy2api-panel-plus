@@ -47,6 +47,11 @@ func responsesToChat(raw []byte) (chat []byte, stream bool, model, errMsg string
 		TopP            *float64          `json:"top_p"`
 		Tools           []json.RawMessage `json:"tools"`
 		ToolChoice      json.RawMessage   `json:"tool_choice"`
+		// 以下三项是对齐 chat 语义的透传/翻译项：官方 Responses 客户端（Codex 等）
+		// 常发，此前一律静默丢弃。字段改写规则见 responsesExtrasToChat。
+		ParallelToolCalls *bool           `json:"parallel_tool_calls"`
+		Reasoning         json.RawMessage `json:"reasoning"`
+		Text              json.RawMessage `json:"text"`
 	}
 	if json.Unmarshal(raw, &req) != nil {
 		return nil, false, "", "invalid JSON body"
@@ -170,8 +175,42 @@ func responsesToChat(raw []byte) (chat []byte, stream bool, model, errMsg string
 			out["tool_choice"] = tc
 		}
 	}
+	responsesExtrasToChat(out, req.ParallelToolCalls, req.Reasoning, req.Text)
 	b, _ := json.Marshal(out)
 	return b, req.Stream, model, ""
+}
+
+// responsesExtrasToChat 把 Responses 的三个常用控制字段落到 chat 语义上。
+//   - parallel_tool_calls → 同名透传（OpenAI 规范字段，上游忽略未知字段，实测 200）
+//   - reasoning.effort    → reasoning_effort（走上游既有的按模型降级管线）
+//   - text.format         → response_format（json_object / json_schema 两种）
+//
+// 三者都是「客户端明确表达的模型行为约束」，丢弃等于让模型按默认跑；翻译不到位的
+// 形态（如 reasoning 非对象、format 缺 type）一律不下发，不编造。
+func responsesExtrasToChat(out map[string]any, parallel *bool, reasoning, text json.RawMessage) {
+	if parallel != nil {
+		out["parallel_tool_calls"] = *parallel
+	}
+	if len(reasoning) > 0 {
+		var rs struct {
+			Effort string `json:"effort"`
+		}
+		if json.Unmarshal(reasoning, &rs) == nil {
+			if e := strings.TrimSpace(rs.Effort); e != "" {
+				out["reasoning_effort"] = strings.ToLower(e)
+			}
+		}
+	}
+	if len(text) > 0 {
+		var ts struct {
+			Format map[string]any `json:"format"`
+		}
+		if json.Unmarshal(text, &ts) == nil && len(ts.Format) > 0 {
+			if ft, _ := ts.Format["type"].(string); strings.TrimSpace(ft) != "" {
+				out["response_format"] = ts.Format
+			}
+		}
+	}
 }
 
 // responsesToolsToChat 把 Responses 的 tools（{type:"function", name, description,
