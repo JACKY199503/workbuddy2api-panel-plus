@@ -75,6 +75,59 @@ type compatRecorder struct {
 	doneSent  bool
 	errored   bool
 	closed    bool
+
+	// 工具调用转写状态（两种协议共用）：
+	//   - 非流式：finish 时从 chat 响应整体解析进 calls；
+	//   - 流式：按 OpenAI delta.tool_calls 的 index 建 Anthropic content_block
+	//     （tool_use），index 由 nextIdx 递增分配，保证与 content 数组顺序一致。
+	nextIdx   int
+	textIdx   int
+	textOpen  bool
+	toolOrder []int
+	tools     map[int]*compatToolBlock
+	calls     []compatToolCall
+}
+
+// compatToolBlock 一个流式 tool_use 内容块的累积状态。
+type compatToolBlock struct {
+	idx     int // Anthropic content_block index
+	id      string
+	name    string
+	args    strings.Builder
+	open    bool
+	stopped bool
+}
+
+// compatToolCall 一个完整的工具调用（两种协议出站渲染的公共形态）。
+type compatToolCall struct {
+	id    string
+	name  string
+	args  string // 字符串化 JSON（arguments / input_json_delta 拼接结果）
+	input any    // args 解析后的对象；解析失败 → 空对象
+}
+
+// toolCalls 输出累积完成的工具调用列表（按出现顺序）。
+func (cr *compatRecorder) toolCalls() []compatToolCall {
+	if len(cr.calls) > 0 {
+		return cr.calls
+	}
+	if len(cr.toolOrder) == 0 {
+		return nil
+	}
+	out := make([]compatToolCall, 0, len(cr.toolOrder))
+	for _, k := range cr.toolOrder {
+		tb, ok := cr.tools[k]
+		if !ok || tb == nil {
+			continue
+		}
+		raw := tb.args.String()
+		var in any
+		if json.Unmarshal([]byte(raw), &in) != nil {
+			in = map[string]any{}
+		}
+		out = append(out, compatToolCall{id: tb.id, name: tb.name, args: raw, input: in})
+	}
+	return out
 }
 
 func newCompatRecorder(w http.ResponseWriter, p compatProto, stream bool, model string) *compatRecorder {
@@ -88,6 +141,7 @@ func newCompatRecorder(w http.ResponseWriter, p compatProto, stream bool, model 
 		msgID:   newCompatID("msg_"),
 		created: time.Now().Unix(),
 		hdr:     make(http.Header),
+		tools:   make(map[int]*compatToolBlock),
 	}
 }
 
@@ -167,6 +221,29 @@ func (cr *compatRecorder) handleFrame(frame string) {
 				if t, ok := d["content"].(string); ok && t != "" {
 					cr.text.WriteString(t)
 					cr.emitDelta(t)
+				}
+				// 工具调用增量：首片带 id/name，后续片只带 arguments 片段。
+				if tcs, ok := d["tool_calls"].([]any); ok {
+					for _, tcv := range tcs {
+						tc, ok2 := tcv.(map[string]any)
+						if tc == nil || !ok2 {
+							continue
+						}
+						idx := 0
+						if v, ok3 := tc["index"].(float64); ok3 {
+							idx = int(v)
+						}
+						id, _ := tc["id"].(string)
+						name, args := "", ""
+						if fn, ok3 := tc["function"].(map[string]any); ok3 {
+							name, _ = fn["name"].(string)
+							args, _ = fn["arguments"].(string)
+						}
+						if id == "" && name == "" && args == "" {
+							continue
+						}
+						cr.emitToolCall(idx, id, name, args)
+					}
 				}
 			}
 			if fr, ok := c["finish_reason"].(string); ok && fr != "" {
@@ -292,10 +369,8 @@ func (cr *compatRecorder) startStream() {
 			"usage": map[string]any{"input_tokens": 0, "output_tokens": 0},
 		},
 	})
-	cr.writeSSE("content_block_start", map[string]any{
-		"type": "content_block_start", "index": 0,
-		"content_block": map[string]any{"type": "text", "text": ""},
-	})
+	// content_block_start 改为懒发：首个 text / tool_use 分片到达时才开块，
+	// 保证块下标按真实出现顺序分配（工具先于文本时也自然对齐）。
 	cr.writeSSE("ping", map[string]any{"type": "ping"})
 }
 
@@ -310,10 +385,138 @@ func (cr *compatRecorder) emitDelta(t string) {
 		})
 		return
 	}
+	cr.ensureTextBlock()
 	cr.writeSSE("content_block_delta", map[string]any{
-		"type": "content_block_delta", "index": 0,
+		"type": "content_block_delta", "index": cr.textIdx,
 		"delta": map[string]any{"type": "text_delta", "text": t},
 	})
+}
+
+// ensureTextBlock 懒开 text 内容块（幂等）：首个文本分片到达时才发
+// content_block_start，块下标从 nextIdx 取。
+func (cr *compatRecorder) ensureTextBlock() {
+	if cr.textOpen {
+		return
+	}
+	cr.textOpen = true
+	cr.textIdx = cr.nextIdx
+	cr.nextIdx++
+	cr.writeSSE("content_block_start", map[string]any{
+		"type": "content_block_start", "index": cr.textIdx,
+		"content_block": map[string]any{"type": "text", "text": ""},
+	})
+}
+
+// emitToolCall 处理一帧 OpenAI delta.tool_calls 分片，按协议转写：
+//   - anthropic：content_block_start(tool_use) → input_json_delta → （收尾时）stop
+//   - responses：output_item.added(function_call) → function_call_arguments.delta
+//
+// 分片形态（链路已按 OpenAI 规范收敛）：首片带 index/id/function.name，后续片只带
+// function.arguments 片段且 name 键已删除。
+func (cr *compatRecorder) emitToolCall(idx int, id, name, args string) {
+	if !cr.started {
+		cr.startStream()
+	}
+	tb, ok := cr.tools[idx]
+	if !ok {
+		if id == "" {
+			id = newCompatID("toolu_")
+		}
+		tb = &compatToolBlock{id: id}
+		cr.tools[idx] = tb
+		cr.toolOrder = append(cr.toolOrder, idx)
+	}
+	if name != "" && tb.name == "" {
+		tb.name = name
+	}
+	if args != "" {
+		tb.args.WriteString(args)
+	}
+	if tb.open {
+		// 已开块：只推参数增量（name 可能晚到，但块已发出，不再补发 start）
+		cr.writeToolArgs(tb, args)
+		return
+	}
+	tb.open = true
+	tb.idx = cr.nextIdx
+	cr.nextIdx++
+	switch cr.proto {
+	case protoResponses:
+		cr.writeSSE("response.output_item.added", map[string]any{
+			"type": "response.output_item.added", "output_index": tb.idx,
+			"item": cr.functionCallItem(tb, "in_progress"),
+		})
+	default:
+		cr.writeSSE("content_block_start", map[string]any{
+			"type": "content_block_start", "index": tb.idx,
+			"content_block": map[string]any{
+				"type": "tool_use", "id": tb.id, "name": tb.name, "input": map[string]any{},
+			},
+		})
+	}
+	if args != "" {
+		cr.writeToolArgs(tb, args)
+	}
+}
+
+// writeToolArgs 推一帧工具参数增量。
+func (cr *compatRecorder) writeToolArgs(tb *compatToolBlock, args string) {
+	if args == "" {
+		return
+	}
+	if cr.proto == protoResponses {
+		cr.writeSSE("response.function_call_arguments.delta", map[string]any{
+			"type": "response.function_call_arguments.delta", "item_id": tb.id,
+			"output_index": tb.idx, "delta": args,
+		})
+		return
+	}
+	cr.writeSSE("content_block_delta", map[string]any{
+		"type": "content_block_delta", "index": tb.idx,
+		"delta": map[string]any{"type": "input_json_delta", "partial_json": args},
+	})
+}
+
+// functionCallItem Responses API 的 function_call output item。
+func (cr *compatRecorder) functionCallItem(tb *compatToolBlock, status string) map[string]any {
+	return map[string]any{
+		"type": "function_call", "id": tb.id, "call_id": tb.id,
+		"name": tb.name, "arguments": tb.args.String(), "status": status,
+	}
+}
+
+// closeBlocks 收尾所有已开内容块（幂等）：text 块 stop → 各 tool 块按序 stop。
+func (cr *compatRecorder) closeBlocks() {
+	if cr.proto == protoResponses {
+		for _, k := range cr.toolOrder {
+			tb := cr.tools[k]
+			if tb == nil || !tb.open || tb.stopped {
+				continue
+			}
+			tb.stopped = true
+			cr.writeSSE("response.function_call_arguments.done", map[string]any{
+				"type": "response.function_call_arguments.done", "item_id": tb.id,
+				"output_index": tb.idx, "arguments": tb.args.String(),
+			})
+			cr.writeSSE("response.output_item.done", map[string]any{
+				"type": "response.output_item.done", "output_index": tb.idx,
+				"item": cr.functionCallItem(tb, "completed"),
+			})
+		}
+		return
+	}
+	if cr.textOpen {
+		cr.textOpen = false
+		cr.writeSSE("content_block_stop", map[string]any{"type": "content_block_stop", "index": cr.textIdx})
+	}
+	for _, k := range cr.toolOrder {
+		tb := cr.tools[k]
+		if tb == nil || !tb.open || tb.stopped {
+			continue
+		}
+		tb.stopped = true
+		cr.writeSSE("content_block_stop", map[string]any{"type": "content_block_stop", "index": tb.idx})
+	}
 }
 
 // emitDone 流式收尾（幂等）：responses 发 output_text.done / output_item.done /
@@ -335,14 +538,20 @@ func (cr *compatRecorder) emitDone() {
 		cr.writeSSE("response.output_item.done", map[string]any{
 			"type": "response.output_item.done", "output_index": 0, "item": cr.outputItem("completed", txt),
 		})
+		// 工具调用块收尾（arguments.done + output_item.done）
+		cr.closeBlocks()
 		cr.writeSSE("response.completed", map[string]any{
 			"type": "response.completed", "response": cr.responseObject("completed", txt),
 		})
 		return
 	}
-	cr.writeSSE("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+	// 空响应（无文本无工具）补一个空 text 块：Anthropic 客户端期望 content 至少一块。
+	if !cr.textOpen && len(cr.toolOrder) == 0 {
+		cr.ensureTextBlock()
+	}
+	cr.closeBlocks()
 	cr.writeSSE("message_delta", map[string]any{
-		"type": "message_delta",
+		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": anthropicStopReason(cr.finishRsn), "stop_sequence": nil},
 		"usage": map[string]any{"output_tokens": cr.tokens("completion_tokens")},
 	})
@@ -367,7 +576,7 @@ func (cr *compatRecorder) emitStreamError(e any) {
 		return
 	}
 	cr.writeSSE("error", map[string]any{
-		"type": "error",
+		"type":  "error",
 		"error": map[string]any{"type": "api_error", "message": msg},
 	})
 }
@@ -382,6 +591,11 @@ func (cr *compatRecorder) writeFinal(chat map[string]any) {
 			if fr, _ := c["finish_reason"].(string); fr != "" {
 				finish = fr
 			}
+			if msg, ok := c["message"].(map[string]any); ok {
+				if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 {
+					cr.calls = parseChatToolCalls(tcs)
+				}
+			}
 		}
 	}
 	if u, ok := chat["usage"].(map[string]any); ok && len(u) > 0 {
@@ -394,12 +608,26 @@ func (cr *compatRecorder) writeFinal(chat map[string]any) {
 		writeJSON(cr.w, http.StatusOK, cr.responseObject(responsesStatus(finish), txt))
 		return
 	}
+	// Anthropic content：文本块在前，其后每个工具调用一个 tool_use 块。
+	// content 不允许为空数组 → 兜底一个空文本块。
+	content := make([]any, 0, len(cr.calls)+1)
+	if txt != "" {
+		content = append(content, map[string]any{"type": "text", "text": txt})
+	}
+	for _, tc := range cr.toolCalls() {
+		content = append(content, map[string]any{
+			"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.input,
+		})
+	}
+	if len(content) == 0 {
+		content = append(content, map[string]any{"type": "text", "text": ""})
+	}
 	writeJSON(cr.w, http.StatusOK, map[string]any{
 		"id":            cr.msgID,
 		"type":          "message",
 		"role":          "assistant",
 		"model":         cr.model,
-		"content":       []any{map[string]any{"type": "text", "text": txt}},
+		"content":       content,
 		"stop_reason":   anthropicStopReason(finish),
 		"stop_sequence": nil,
 		"usage": map[string]any{
@@ -409,16 +637,57 @@ func (cr *compatRecorder) writeFinal(chat map[string]any) {
 	})
 }
 
+// parseChatToolCalls 从 chat 响应的 message.tool_calls 解析工具调用列表。
+func parseChatToolCalls(raws []any) []compatToolCall {
+	out := make([]compatToolCall, 0, len(raws))
+	for _, r := range raws {
+		tc, ok := r.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := ""
+		args := ""
+		if fn, ok := tc["function"].(map[string]any); ok {
+			name, _ = fn["name"].(string)
+			args, _ = fn["arguments"].(string)
+		}
+		if name == "" {
+			continue
+		}
+		id, _ := tc["id"].(string)
+		if id == "" {
+			id = newCompatID("toolu_")
+		}
+		var in any
+		if json.Unmarshal([]byte(args), &in) != nil {
+			in = map[string]any{}
+		}
+		out = append(out, compatToolCall{id: id, name: name, args: args, input: in})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // responseObject Responses API 响应对象（status 决定进行中/完成）。
 func (cr *compatRecorder) responseObject(status, txt string) map[string]any {
 	item := cr.outputItem(status, txt)
+	// 工具调用作为 function_call item 挂在 output 尾部（Responses 规范形态）。
+	output := []any{item}
+	for _, tc := range cr.toolCalls() {
+		output = append(output, map[string]any{
+			"type": "function_call", "id": tc.id, "call_id": tc.id,
+			"name": tc.name, "arguments": tc.args, "status": status,
+		})
+	}
 	out := map[string]any{
 		"id":         cr.id,
 		"object":     "response",
 		"created_at": cr.created,
 		"status":     status,
 		"model":      cr.model,
-		"output":     []any{item},
+		"output":     output,
 		"usage": map[string]any{
 			"input_tokens":  cr.tokens("prompt_tokens"),
 			"output_tokens": cr.tokens("completion_tokens"),

@@ -13,10 +13,13 @@ import (
 //   - model：必填，与 /v1/chat/completions 同语义（可写 cn:/global: 前缀或编排虚拟名）
 //   - input：必填，字符串 或 [{role, content}] 数组（content 支持 input_text / input_image）
 //   - instructions：可选，映射为 system 消息
+//   - tools：可选，[{type:"function", name, description, parameters}] → OpenAI tools
+//   - tool_choice：可选，"auto" / "required" / "none" / {type:"function", name}
 //   - stream / max_output_tokens / temperature / top_p：可选，映射为 chat 同义字段
 //
-// 不支持的字段（tools / previous_response_id / reasoning 等）静默忽略：网关是
-// 转发层，编造这些语义只会给出假成功。
+// 不支持的字段（previous_response_id / reasoning 等）静默忽略：网关是转发层，
+// 编造这些语义只会给出假成功。input 里的 function_call / function_call_output
+// 项已支持（多轮工具调用的会话回放，缺失会让 Codex 之类客户端的后续轮次 400）。
 func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	raw, err := readAllBody(r)
 	if err != nil {
@@ -35,13 +38,15 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 // 返回翻译后的 body / 是否流式 / 模型名 / 错误文案（空串 = 成功）。
 func responsesToChat(raw []byte) (chat []byte, stream bool, model, errMsg string) {
 	var req struct {
-		Model           string          `json:"model"`
-		Input           json.RawMessage `json:"input"`
-		Instructions    json.RawMessage `json:"instructions"`
-		Stream          bool            `json:"stream"`
-		MaxOutputTokens *int            `json:"max_output_tokens"`
-		Temperature     *float64        `json:"temperature"`
-		TopP            *float64        `json:"top_p"`
+		Model           string            `json:"model"`
+		Input           json.RawMessage   `json:"input"`
+		Instructions    json.RawMessage   `json:"instructions"`
+		Stream          bool              `json:"stream"`
+		MaxOutputTokens *int              `json:"max_output_tokens"`
+		Temperature     *float64          `json:"temperature"`
+		TopP            *float64          `json:"top_p"`
+		Tools           []json.RawMessage `json:"tools"`
+		ToolChoice      json.RawMessage   `json:"tool_choice"`
 	}
 	if json.Unmarshal(raw, &req) != nil {
 		return nil, false, "", "invalid JSON body"
@@ -83,7 +88,49 @@ func responsesToChat(raw []byte) (chat []byte, stream bool, model, errMsg string
 		if len(items) == 0 {
 			return nil, false, "", "input is required"
 		}
+		// 连续的 function_call 项合并成一条 assistant.tool_calls 消息（OpenAI 要求
+		// 一次 assistant 消息带齐本轮全部调用，其 tool 结果紧随其后）。
+		var pending []any
+		flush := func() {
+			if len(pending) == 0 {
+				return
+			}
+			msgs = append(msgs, map[string]any{"role": "assistant", "content": "", "tool_calls": pending})
+			pending = nil
+		}
 		for _, it := range items {
+			switch typ, _ := it["type"].(string); typ {
+			case "function_call":
+				name, _ := it["name"].(string)
+				if name == "" {
+					continue
+				}
+				id, _ := it["call_id"].(string)
+				if id == "" {
+					id, _ = it["id"].(string)
+				}
+				if id == "" {
+					id = newCompatID("call_")
+				}
+				pending = append(pending, map[string]any{
+					"id": id, "type": "function",
+					"function": map[string]any{"name": name, "arguments": toolArgsJSON(it["arguments"])},
+				})
+				continue
+			case "function_call_output":
+				flush()
+				id, _ := it["call_id"].(string)
+				if id == "" {
+					id, _ = it["id"].(string)
+				}
+				if id == "" {
+					continue
+				}
+				msgs = append(msgs, map[string]any{
+					"role": "tool", "tool_call_id": id, "content": toolResultText(it["output"]),
+				})
+				continue
+			}
 			role, _ := it["role"].(string)
 			switch role {
 			case "user", "assistant", "system", "developer":
@@ -96,6 +143,7 @@ func responsesToChat(raw []byte) (chat []byte, stream bool, model, errMsg string
 			}
 			msgs = append(msgs, map[string]any{"role": role, "content": c})
 		}
+		flush()
 	}
 	if len(msgs) == 0 {
 		return nil, false, "", "input is required"
@@ -115,8 +163,68 @@ func responsesToChat(raw []byte) (chat []byte, stream bool, model, errMsg string
 	if req.TopP != nil {
 		out["top_p"] = *req.TopP
 	}
+	// tools / tool_choice：无 tools 时 tool_choice 无意义（上游会 400），整体不下发。
+	if tools := responsesToolsToChat(req.Tools); len(tools) > 0 {
+		out["tools"] = tools
+		if tc := anthropicToolChoice(req.ToolChoice); tc != nil {
+			out["tool_choice"] = tc
+		}
+	}
 	b, _ := json.Marshal(out)
 	return b, req.Stream, model, ""
+}
+
+// responsesToolsToChat 把 Responses 的 tools（{type:"function", name, description,
+// parameters}）翻译成 OpenAI tools 形态；形态不对 / 缺 name 的项跳过。
+func responsesToolsToChat(raws []json.RawMessage) []any {
+	if len(raws) == 0 {
+		return nil
+	}
+	out := make([]any, 0, len(raws))
+	for _, raw := range raws {
+		var t struct {
+			Name        string         `json:"name"`
+			Description string         `json:"description"`
+			Parameters  map[string]any `json:"parameters"`
+			// 少数客户端直接发 OpenAI 形态（带 function 子树），一并兼容。
+			Function map[string]any `json:"function"`
+		}
+		if json.Unmarshal(raw, &t) != nil {
+			continue
+		}
+		name := strings.TrimSpace(t.Name)
+		desc := t.Description
+		schema := t.Parameters
+		if fn := t.Function; fn != nil {
+			if name == "" {
+				if n, _ := fn["name"].(string); n != "" {
+					name = strings.TrimSpace(n)
+				}
+			}
+			if desc == "" {
+				desc, _ = fn["description"].(string)
+			}
+			if schema == nil {
+				schema, _ = fn["parameters"].(map[string]any)
+			}
+		}
+		if name == "" {
+			continue
+		}
+		if schema == nil {
+			schema = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+		out = append(out, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": name, "description": desc, "parameters": schema,
+			},
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // responsesContent 把 Responses 的 content（字符串 / 块数组）翻译成 chat content。
